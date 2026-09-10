@@ -429,8 +429,13 @@ class TimetableViewModel(application: Application) : AndroidViewModel(applicatio
                 loadCalendarFromAsset()
                 return
             }
+            val scheduleFilter = json
+                .optJSONObject("meta")
+                ?.optString("timetableId", "")
+                ?.let { deriveCalendarScheduleId(it) }
+                .orEmpty()
             val parsed = withContext(Dispatchers.IO) {
-                parseCalendarEvents(json.optJSONArray("events") ?: JSONArray())
+                parseCalendarEvents(json.optJSONArray("events") ?: JSONArray(), scheduleFilter)
             }
             repository.resetCalendarEvents(parsed)
         } catch (e: Exception) {
@@ -452,10 +457,14 @@ class TimetableViewModel(application: Application) : AndroidViewModel(applicatio
         repository.resetCalendarEvents(events)
     }
 
-    private fun parseCalendarEvents(array: JSONArray): List<CalendarEvent> {
+    private fun parseCalendarEvents(array: JSONArray, scheduleFilter: String = ""): List<CalendarEvent> {
         val out = mutableListOf<CalendarEvent>()
         for (i in 0 until array.length()) {
             val o = array.getJSONObject(i)
+            val declared = o.optString("scheduleId", "").trim()
+            if (scheduleFilter.isNotEmpty() && declared.isNotEmpty() && declared != scheduleFilter) {
+                continue
+            }
             val dates = parseCalendarDates(o.optString("date", o.optString("Date", "")))
             if (dates.isEmpty()) continue
             val details = o.optString("details", o.optString("Details", ""))
@@ -466,6 +475,16 @@ class TimetableViewModel(application: Application) : AndroidViewModel(applicatio
             }
         }
         return out.sortedBy { it.date }
+    }
+
+    private fun deriveCalendarScheduleId(timetableId: String): String {
+        if (timetableId.isBlank()) return ""
+        val s = timetableId.trim()
+        if (!s.startsWith("TT-") && !s.startsWith("CAL-")) return ""
+        val middle = s.removePrefix("TT-").removePrefix("CAL-")
+        if (middle == s || middle.count { it == '-' } < 3) return ""
+        val noDept = if (middle.count { it == '-' } >= 4) middle.substringBeforeLast('-') else middle
+        return "CAL-" + noDept
     }
 
     private fun parseCalendarDates(dateStr: String): List<String> {

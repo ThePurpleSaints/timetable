@@ -21,7 +21,10 @@ the TIMETABLE_ADMIN_TOKEN environment variable.
 import datetime
 import json
 import os
+import queue
+import re
 import sys
+import threading
 import tkinter as tk
 import urllib.error
 import urllib.request
@@ -57,6 +60,10 @@ class Api:
     def __init__(self, base="http://localhost:8003", token=DEV_TOKEN):
         self.base = base
         self.token = token
+        self.on_activity = None   # callable(busy: bool), safely driven from the main thread
+        self._lock = threading.Lock()
+        self._busy = 0
+        self._queue = queue.Queue()  # (fn, args) drained on the Tk main thread
 
     def call(self, method, path, body=None, on_error=None):
         url = self.base.rstrip("/") + path
@@ -86,16 +93,49 @@ class Api:
                 on_error(str(exc))
             return None
 
+    def async_call(self, method, path, body=None, on_done=None, on_error=None):
+        """Run call() on a worker thread; on_done/on_error fire on the main thread."""
+
+        def run():
+            error = []
+            try:
+                result = self.call(method, path, body, on_error=lambda m: error.append(m))
+            except Exception as exc:  # noqa: BLE001
+                error.append(str(exc))
+                result = None
+            with self._lock:
+                self._busy -= 1
+            self._set_busy(self._busy > 0)
+            if error:
+                if on_error:
+                    self._schedule(on_error, error[0])
+            elif on_done:
+                self._schedule(on_done, result)
+
+        with self._lock:
+            self._busy += 1
+        self._set_busy(True)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _set_busy(self, busy):
+        if self.on_activity:
+            self._queue.put((self.on_activity, (busy,)))
+
+    def _schedule(self, fn, *args):
+        self._queue.put((fn, args))
+
 
 class EditorApp:
     def __init__(self, root, initial_url=None, initial_token=None):
         self.api = Api()
+        self.api.on_activity = self._set_activity
         self.root = root
         self.snapshot = None
         self.section = None
         self._editing_event_id = None
         self._editing_override_id = None
         self.override_id_holder = None
+        self._connect_seq = 0
 
         root.title("Timetable Admin Editor")
         root.geometry("1020x700")
@@ -103,7 +143,17 @@ class EditorApp:
         self._build_connection_bar(initial_url, initial_token)
         self._build_notebook()
         self._build_log()
+        self._drain_worker_queue()
         root.after(250, self.connect)
+
+    def _drain_worker_queue(self):
+        try:
+            while True:
+                fn, args = self.api._queue.get_nowait()
+                fn(*args)
+        except queue.Empty:
+            pass
+        self.root.after(50, self._drain_worker_queue)
 
     # ---------- UI scaffolding -------------------------------------------
     def _build_connection_bar(self, initial_url, initial_token):
@@ -123,6 +173,14 @@ class EditorApp:
         ttk.Button(bar, text="Connect", command=self.connect).pack(side="left", padx=4)
         self.status_var = tk.StringVar(value="Not connected")
         ttk.Label(bar, textvariable=self.status_var, foreground="#2b6cb0").pack(side="left", padx=8)
+        self.progress = ttk.Progressbar(bar, mode="indeterminate", length=120)
+        self.progress.pack(side="left", padx=4)
+
+    def _set_activity(self, busy):
+        if busy:
+            self.progress.start(12)
+        else:
+            self.progress.stop()
 
     def _toggle_token_show(self):
         self.token_entry.config(show="" if self.token_entry.cget("show") == "*" else "*")
@@ -205,7 +263,7 @@ class EditorApp:
             values = [str(row), time_col]
             for day in DAYS:
                 cells = weekly.get(day, [])
-                values.append(_cell_label(cells[row]) if row < len(cells) else "")
+                values.append(_short_cell_label(cells[row]) if row < len(cells) else "")
             self.grid.insert("", "end", values=values)
 
     def _cell_at(self, day, row):
@@ -224,9 +282,9 @@ class EditorApp:
             return
         row = self.grid.index(iid)
         col = int(self.grid.identify_column(_event.x).lstrip("#")) - 1
-        if col < 2 or col > 7:  # ignore # / Time columns
+        if col < 2 or col > 8:  # skip # / Time columns, allow Monday..Sunday
             return
-        day = DAYS[col - 1]
+        day = DAYS[col - 2]
         cell = self._cell_at(day, row)
         if not cell:
             return
@@ -254,10 +312,15 @@ class EditorApp:
                 "ordinal": row,
                 "cell": edited,
             }
-            response = self.api.call("PUT", "/api/v1/admin/cell", body, self._on_api_error)
-            if response and response.get("ok"):
-                self.log_line(f"Updated {day} #{row}: {edited.get('courseName', '')}")
-                self.connect(reload_only=True)
+            self.api.async_call(
+                "PUT", "/api/v1/admin/cell", body,
+                on_done=lambda resp: self._cell_saved(resp, day, row, edited),
+                on_error=self._on_api_error)
+
+    def _cell_saved(self, response, day, row, edited):
+        if response and response.get("ok"):
+            self.log_line(f"Updated {day} #{row}: {edited.get('courseName', '')}")
+            self.connect(reload_only=True)
 
     # ---------- Calendar tab ---------------------------------------------
     def _build_calendar_tab(self):
@@ -377,20 +440,33 @@ class EditorApp:
                 events.remove(old)
                 if old_schedule != schedule:
                     remaining_old = [e for e in events if e.get("scheduleId") == old_schedule]
-                    r = self.api.call("POST", "/api/v1/admin/calendar",
-                                      {"scheduleId": old_schedule, "events": remaining_old}, self._on_api_error)
-                    if not (r and r.get("ok")):
-                        return
+                    target = [e for e in events if e.get("scheduleId") == schedule]
+                    self.api.async_call(
+                        "POST", "/api/v1/admin/calendar",
+                        {"scheduleId": old_schedule, "events": remaining_old},
+                        on_done=lambda r: self._move_then_save(r, schedule, target, date),
+                        on_error=self._on_api_error)
+                    return
                 events.append(updated)
         else:
             events.append(updated)
         target = [e for e in events if e.get("scheduleId") == schedule]
-        response = self.api.call("POST", "/api/v1/admin/calendar",
-                                 {"scheduleId": schedule, "events": target}, self._on_api_error)
+        self._save_calendar(schedule, target, date)
+
+    def _move_then_save(self, response, schedule, target, date):
         if response and response.get("ok"):
-            action = "saved" if self._editing_event_id is not None else "added"
-            self.log_line(f"{action.title()} event {date} in {schedule}")
-            self.connect(reload_only=True)
+            self._save_calendar(schedule, target, date)
+
+    def _save_calendar(self, schedule, target, date):
+        def done(response):
+            if response and response.get("ok"):
+                action = "saved" if self._editing_event_id is not None else "added"
+                self.log_line(f"{action.title()} event {date} in {schedule}")
+                self.connect(reload_only=True)
+        self.api.async_call(
+            "POST", "/api/v1/admin/calendar",
+            {"scheduleId": schedule, "events": target},
+            on_done=done, on_error=self._on_api_error)
 
     def edit_selected_event(self):
         selection = self.event_list.curselection()
@@ -407,8 +483,13 @@ class EditorApp:
         if not schedule_id:
             return
         schedule_id = schedule_id.strip().upper()
-        response = self.api.call("POST", "/api/v1/admin/calendar",
-                                 {"scheduleId": schedule_id, "events": []}, self._on_api_error)
+        self.api.async_call(
+            "POST", "/api/v1/admin/calendar",
+            {"scheduleId": schedule_id, "events": []},
+            on_done=lambda response: self._schedule_created(response, schedule_id),
+            on_error=self._on_api_error)
+
+    def _schedule_created(self, response, schedule_id):
         if response and response.get("ok"):
             self.log_line(f"Created schedule {schedule_id}")
             self.connect(reload_only=True)
@@ -421,8 +502,13 @@ class EditorApp:
         if not messagebox.askyesno("Clear schedule?",
                                     f"Delete ALL events in {schedule}?\n(Timetable away-days vanish too.)"):
             return
-        response = self.api.call("POST", "/api/v1/admin/calendar",
-                                 {"scheduleId": schedule, "events": []}, self._on_api_error)
+        self.api.async_call(
+            "POST", "/api/v1/admin/calendar",
+            {"scheduleId": schedule, "events": []},
+            on_done=lambda response: self._schedule_cleared(response, schedule),
+            on_error=self._on_api_error)
+
+    def _schedule_cleared(self, response, schedule):
         if response and response.get("ok"):
             self.log_line(f"Cleared schedule {schedule}")
             self.connect(reload_only=True)
@@ -435,9 +521,12 @@ class EditorApp:
         event = self._event_id_map.get(selection[0])
         if not messagebox.askyesno("Delete?", f"Delete {event.get('details')} on {event.get('date')}?"):
             return
-        response = self.api.call(
-            "DELETE", f"/api/v1/admin/calendar/{event['id']}", on_error=self._on_api_error
-        )
+        self.api.async_call(
+            "DELETE", f"/api/v1/admin/calendar/{event['id']}",
+            on_done=lambda response: self._event_deleted(response, event),
+            on_error=self._on_api_error)
+
+    def _event_deleted(self, response, event):
         if response and response.get("ok"):
             self.log_line(f"Deleted event {event['id']}")
             self.connect(reload_only=True)
@@ -527,7 +616,12 @@ class EditorApp:
         }
         if self._editing_override_id is not None:
             override["id"] = self._editing_override_id
-        response = self.api.call("POST", "/api/v1/admin/override", {"override": override}, self._on_api_error)
+        self.api.async_call(
+            "POST", "/api/v1/admin/override", {"override": override},
+            on_done=lambda response: self._override_saved(response, override),
+            on_error=self._on_api_error)
+
+    def _override_saved(self, response, override):
         if response and response.get("ok"):
             self.log_line(f"Saved override for {override['sectionId'] or '?'} on {override['date']}")
             self.prepare_new_override()
@@ -541,9 +635,12 @@ class EditorApp:
         override_id = int(text.split(":")[0])
         if not messagebox.askyesno("Delete?", f"Delete override #{override_id}?"):
             return
-        response = self.api.call(
-            "DELETE", f"/api/v1/admin/override/{override_id}", on_error=self._on_api_error
-        )
+        self.api.async_call(
+            "DELETE", f"/api/v1/admin/override/{override_id}",
+            on_done=lambda response: self._override_deleted(response, override_id),
+            on_error=self._on_api_error)
+
+    def _override_deleted(self, response, override_id):
         if response and response.get("ok"):
             self.log_line(f"Deleted override #{override_id}")
             self.connect(reload_only=True)
@@ -663,21 +760,24 @@ class EditorApp:
             if not name:
                 messagebox.showerror("Bad name", "Name is required.")
                 return
-            response = self.api.call(
+            self.api.async_call(
                 "POST", "/api/v1/admin/professor",
                 {"name": name, "department": dept_entry.get().strip() or "CSE"},
-                self._on_api_error)
-            if response and response.get("ok"):
-                result.append(True)
-                dialog.destroy()
-                self.log_line(f"Added professor {name}")
-                self.connect(reload_only=True)
+                on_done=lambda response: self._professor_added(response, dialog, result, name),
+                on_error=self._on_api_error)
 
         ttk.Button(dialog, text="Add", command=save).grid(row=2, column=0, columnspan=2, pady=8)
         dialog.transient(self.root)
         dialog.grab_set()
         self.root.wait_window(dialog)
         return bool(result)
+
+    def _professor_added(self, response, dialog, result, name):
+        if response and response.get("ok"):
+            result.append(True)
+            dialog.destroy()
+            self.log_line(f"Added professor {name}")
+            self.connect(reload_only=True)
 
     def _remove_professor(self):
         selection = self.professors_list.curselection()
@@ -689,8 +789,12 @@ class EditorApp:
             return
         if not messagebox.askyesno("Remove?", f"Remove professor '{name}' and all their course mappings?"):
             return
-        response = self.api.call(
-            "DELETE", f"/api/v1/admin/professor/{prof['id']}", on_error=self._on_api_error)
+        self.api.async_call(
+            "DELETE", f"/api/v1/admin/professor/{prof['id']}",
+            on_done=lambda response: self._professor_removed(response, name),
+            on_error=self._on_api_error)
+
+    def _professor_removed(self, response, name):
         if response and response.get("ok"):
             self.log_line(f"Removed professor {name}")
             self.connect(reload_only=True)
@@ -755,19 +859,23 @@ class EditorApp:
             }
             if editing and editing.get("id"):
                 body["id"] = editing["id"]
-            response = self.api.call("POST", "/api/v1/admin/professor-course",
-                                     {"course": body}, self._on_api_error)
-            if response and response.get("ok"):
-                result.append(True)
-                dialog.destroy()
-                self.log_line(f"Saved mapping {payload['courseCode']} for class {payload['classId']}")
-                self.connect(reload_only=True)
+            self.api.async_call(
+                "POST", "/api/v1/admin/professor-course", {"course": body},
+                on_done=lambda response: self._prof_course_saved(response, dialog, result, payload),
+                on_error=self._on_api_error)
 
         ttk.Button(dialog, text="Save", command=save).grid(row=len(fields), column=0, columnspan=2, pady=8)
         dialog.transient(self.root)
         dialog.grab_set()
         self.root.wait_window(dialog)
         return bool(result)
+
+    def _prof_course_saved(self, response, dialog, result, payload):
+        if response and response.get("ok"):
+            result.append(True)
+            dialog.destroy()
+            self.log_line(f"Saved mapping {payload['courseCode']} for class {payload['classId']}")
+            self.connect(reload_only=True)
 
     def _remove_prof_course(self):
         selection = self.prof_courses_list.curselection()
@@ -782,8 +890,12 @@ class EditorApp:
             return
         if not messagebox.askyesno("Remove?", f"Remove mapping for course '{code}'?"):
             return
-        response = self.api.call(
-            "DELETE", f"/api/v1/admin/professor-course/{mapping['id']}", on_error=self._on_api_error)
+        self.api.async_call(
+            "DELETE", f"/api/v1/admin/professor-course/{mapping['id']}",
+            on_done=lambda response: self._prof_course_removed(response, code),
+            on_error=self._on_api_error)
+
+    def _prof_course_removed(self, response, code):
         if response and response.get("ok"):
             self.log_line(f"Removed mapping for {code}")
             self.connect(reload_only=True)
@@ -799,11 +911,23 @@ class EditorApp:
             messagebox.showerror("API error", message)
 
     def connect(self, reload_only=False):
+        self._connect_seq += 1
+        seq = self._connect_seq
         self.api.base = self.server_var.get().strip() or "http://localhost:8003"
         self.api.token = self.token_var.get().strip()
         if not reload_only:
             self.log_line(f"Connecting to {self.api.base} ...")
-        probe = self.api.call("GET", "/api/v1/admin/meta", on_error=self._on_api_error)
+            self.status_var.set("Connecting ...")
+        else:
+            self.status_var.set("Reloading ...")
+        self.api.async_call(
+            "GET", "/api/v1/admin/meta",
+            on_done=lambda probe: self._on_meta(probe, seq),
+            on_error=self._on_api_error)
+
+    def _on_meta(self, probe, seq):
+        if seq != self._connect_seq:
+            return
         if probe is None:
             self.status_var.set("Connection failed")
             return
@@ -812,9 +936,17 @@ class EditorApp:
             self._on_api_error("401 Unauthorized: invalid admin token")
             return
         self.status_var.set(f"Authenticated [{self.api.base}]")
-        self.snapshot = self.api.call("GET", "/api/v1/admin/editor", on_error=self._on_api_error)
-        if not self.snapshot:
+        self.api.async_call(
+            "GET", "/api/v1/admin/editor",
+            on_done=lambda snapshot: self._on_snapshot(snapshot, seq),
+            on_error=self._on_api_error)
+
+    def _on_snapshot(self, snapshot, seq):
+        if seq != self._connect_seq:
             return
+        if not snapshot:
+            return
+        self.snapshot = snapshot
         _save_config({"url": self.api.base, "token": self.api.token})
         self.meta = {key: self.snapshot.get(key, "") for key in META_FIELDS}
         self._calendar_events = self.snapshot.get("calendar", [])
@@ -866,7 +998,12 @@ class EditorApp:
         edited = _dict_dialog(self.root, "Dataset info", META_FIELDS, values)
         if edited is None:
             return
-        response = self.api.call("PUT", "/api/v1/admin/meta", edited, self._on_api_error)
+        self.api.async_call(
+            "PUT", "/api/v1/admin/meta", edited,
+            on_done=lambda response: self._meta_saved(response, edited),
+            on_error=self._on_api_error)
+
+    def _meta_saved(self, response, edited):
         if response and response.get("ok"):
             self.log_line("Dataset info saved: " + ", ".join(f"{k}={edited[k]}" for k in edited))
             self.connect(reload_only=True)
@@ -890,7 +1027,12 @@ class EditorApp:
             "classroom": classroom.strip(),
             "weeklyTimetable": {},
         }
-        response = self.api.call("POST", "/api/v1/admin/section", {"section": section}, self._on_api_error)
+        self.api.async_call(
+            "POST", "/api/v1/admin/section", {"section": section},
+            on_done=lambda response: self._section_added(response, section_id),
+            on_error=self._on_api_error)
+
+    def _section_added(self, response, section_id):
         if response and response.get("ok"):
             self.log_line(f"Added section {section_id}")
             self.connect(reload_only=True)
@@ -904,10 +1046,14 @@ class EditorApp:
                               ["sectionName", "classroom"], values)
         if edited is None:
             return
-        response = self.api.call("PUT", f"/api/v1/admin/section/{self.section['sectionId']}",
-                                 edited, self._on_api_error)
+        self.api.async_call(
+            "PUT", f"/api/v1/admin/section/{self.section['sectionId']}", edited,
+            on_done=lambda response: self._section_renamed(response, self.section['sectionId']),
+            on_error=self._on_api_error)
+
+    def _section_renamed(self, response, section_id):
         if response and response.get("ok"):
-            self.log_line(f"Section {self.section['sectionId']} updated")
+            self.log_line(f"Section {section_id} updated")
             self.connect(reload_only=True)
 
     # --- cell editing ---
@@ -926,12 +1072,13 @@ class EditorApp:
             "room": "",
             "inCharge": "",
         }
-        response = self.api.call(
-            "POST",
-            "/api/v1/admin/cell",
+        self.api.async_call(
+            "POST", "/api/v1/admin/cell",
             {"sectionId": self.section["sectionId"], "day": day, "cell": new_cell},
-            self._on_api_error,
-        )
+            on_done=lambda response: self._cell_added(response, day),
+            on_error=self._on_api_error)
+
+    def _cell_added(self, response, day):
         if response and response.get("ok"):
             self.log_line(f"Added cell to {day} (ordinal {response.get('ordinal')})")
             self.connect(reload_only=True)
@@ -947,17 +1094,52 @@ class EditorApp:
         day = text_choice(self.root, "Day", "Delete from which day?", DAYS)
         if day is None:
             return
-        response = self.api.call(
+        self.api.async_call(
             "DELETE",
             f"/api/v1/admin/cell?sectionId={self.section['sectionId']}&day={day}&ordinal={row}",
-            on_error=self._on_api_error,
-        )
+            on_done=lambda response: self._cell_deleted(response, day, row),
+            on_error=self._on_api_error)
+
+    def _cell_deleted(self, response, day, row):
         if response and response.get("ok"):
             self.log_line(f"Deleted {day} #{row}")
             self.connect(reload_only=True)
 
 
 # ---------- small helpers ------------------------------------------------
+def _acronym(name, max_len=5):
+    if not name:
+        return ""
+    base = re.sub(r"\s*\([Ll][^)]*\)", "", name.strip())
+    for suffix in ("Laboratory", "Lab"):
+        if base.endswith(" " + suffix):
+            base = base[:-(len(suffix) + 1)]
+            break
+    words = [w for w in re.split(r"[^A-Za-z0-9]+", base) if w]
+    if len(words) == 1:
+        token = words[0]
+        return (token[:max_len] if len(token) > max_len else token).upper()
+    stop = {"and", "of", "the", "for", "with", "in", "to", "a", "an", "at"}
+    significant = [w for w in words if w.lower() not in stop] or words
+    letters = [w[0].upper() for w in significant]
+    if not letters:
+        return ""
+    joined = "".join(letters)
+    return joined if len(joined) <= max_len else joined[:max_len]
+
+
+def _short_cell_label(cell):
+    room = (cell.get("room") or "").strip()
+    if cell.get("cellType") == "break":
+        label = _acronym(cell.get("courseName")) or "BREAK"
+        return f"{label}{(' · ' + room) if room else ''}"
+    if cell.get("cellType") == "activity":
+        label = (cell.get("activity") or "ACT").strip()
+        return f"[{label}]{(' ' + room) if room else ''}"
+    label = _acronym(cell.get("courseName")) or (cell.get("courseCode") or "").strip() or "?"
+    return f"{label}{(' · ' + room) if room else ''}"
+
+
 def _cell_label(cell):
     if cell.get("cellType") == "break":
         return f"[break] {cell.get('courseName', '')}"

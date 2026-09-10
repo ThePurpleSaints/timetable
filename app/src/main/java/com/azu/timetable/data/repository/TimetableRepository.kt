@@ -65,9 +65,4 @@ class TimetableRepository(
         calendarEventDao.clearAll()
         calendarEventDao.insertAll(events)
     }
-
-    suspend fun resetToDefaultSchedule() {
-        timetableDao.clearAll()
-        timetableDao.insertSlots(DefaultTimetable.getInitialSlots())
-    }
 }

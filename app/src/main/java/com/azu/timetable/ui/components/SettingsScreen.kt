@@ -569,7 +569,7 @@ fun SettingsScreen(
         AlertDialog(
             onDismissRequest = { showResetDialog = false },
             title = { Text("Reset Timetable?") },
-            text = { Text("This will restore the timetable from the dataset for the selected class.") },
+            text = { Text("This will re-fetch the latest timetable from the server and discard your local edits for this class.") },
             confirmButton = {
                 TextButton(
                     onClick = {

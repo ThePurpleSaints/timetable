@@ -348,7 +348,7 @@ class TimetableViewModel(application: Application) : AndroidViewModel(applicatio
             }
         }
 
-    private suspend fun syncTimetableFromServer(sectionId: String) {
+    private suspend fun syncTimetableFromServer(sectionId: String, force: Boolean = false) {
         try {
             val json = fetchJson("$SERVER_BASE/api/v1/db/timetable?class=$sectionId")
                 ?: run {
@@ -357,7 +357,7 @@ class TimetableViewModel(application: Application) : AndroidViewModel(applicatio
                 }
             val version = json.optString("version", "")
             val storedVersion = prefs.getString("timetable_version_$sectionId", null)
-            if (version.isNotEmpty() && version != storedVersion && json.has("section")) {
+            if (json.has("section") && (force || (version.isNotEmpty() && version != storedVersion))) {
                 val newSlots = withContext(Dispatchers.IO) {
                     parseSectionToSlots(json.getJSONObject("section"))
                 }
@@ -604,8 +604,12 @@ class TimetableViewModel(application: Application) : AndroidViewModel(applicatio
     fun resetToDefault() {
         viewModelScope.launch {
             cancelAllAlarms()
-            repository.resetToDefaultSchedule()
+            val sectionId = _selectedClass.value
+            syncTimetableFromServer(sectionId, force = true)
+            syncOverridesFromServer(sectionId)
+            syncCalendarFromServer(sectionId)
             scheduleAllActiveAlarms()
+            _toast.value = "Timetable reset from server"
         }
     }
 

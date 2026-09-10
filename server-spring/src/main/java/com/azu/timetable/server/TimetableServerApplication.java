@@ -1,0 +1,12 @@
+package com.azu.timetable.server;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class TimetableServerApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(TimetableServerApplication.class, args);
+    }
+}

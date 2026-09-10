@@ -1,0 +1,27 @@
+plugins {
+    id 'java'
+    id 'application'
+    id 'org.springframework.boot' version '4.1.0'
+}
+
+group = 'com.azu'
+version = '1.2.0'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+repositories {
+    mavenCentral()
+}
+
+application {
+    mainClass = 'com.azu.timetable.server.TimetableServerApplication'
+}
+
+dependencies {
+    implementation platform('org.springframework.boot:spring-boot-dependencies:4.1.0')
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.xerial:sqlite-jdbc:3.46.1.3'
+}

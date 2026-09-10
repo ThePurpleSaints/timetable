@@ -123,9 +123,21 @@ The raw dataset as plain JSON.
 | GET    | `/calendar`            | `{scheduleIds, events}` overview       |
 | POST   | `/calendar`            | Replace all events for a `scheduleId`  |
 | DELETE | `/calendar/{eventId}`  | Delete one calendar event              |
+| GET    | `/professors`          | `{professors, courses}` roster + class-course mappings |
+| POST   | `/professor`           | Add a professor `{name, department}`  |
+| DELETE | `/professor/{id}`      | Remove a professor (cascades mappings)|
+| POST   | `/professor-course`    | Upsert a class→course→professor mapping |
+| DELETE | `/professor-course/{id}` | Remove one mapping                   |
 
 Admin writes are persisted to SQLite, then re-exported to the dataset JSON and
 mirrored to the app asset files, so the on-device default stays in sync.
+
+Professors are networked into the same SQLite file: `professors` (name +
+department) and `professor_courses` (professor ↦ class section + course code /
+name / room). On first start the server seeds both tables automatically by
+scanning every section's timetable cells and grouping by
+(class, course code, in-charge). Picking a course code in the editor fills the
+professor, subject and room for you.
 
 ## Run
 

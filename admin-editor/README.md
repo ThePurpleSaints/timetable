@@ -16,7 +16,15 @@ You can:
 - add / delete cells on any day, add new sections, rename sections,
 - edit the dataset headers (timetableId, academic year, department, semester, year),
 - manage academic calendar events per schedule: add, edit, delete, create or clear a whole schedule,
-- add, edit or cancel on-date overrides.
+- add, edit or cancel on-date overrides,
+- maintain a professor network: a department + class dropdown, each class's
+  course→professor→room mappings, add / remove professors, and add / edit /
+  remove course mappings,
+- pick a course code in the cell edit dialog and it auto-fills the subject,
+  professor and room from that class's mappings.
+
+The editor remembers the last server + token it connected to
+(`~/.timetable_admin_editor.json`) and reconnects automatically on start.
 
 ## The idea it demonstrates: one ID, infinitely scalable
 

@@ -338,6 +338,89 @@ Map<String, Object> snapshot = sqlite.editorSnapshot();
         return okResponse();
     }
 
+    // ---------- professors -------------------------------------------------
+
+    @GetMapping("/professors")
+    public Map<String, Object> professorsSnapshot(
+            @RequestHeader(value = "Authorization", required = false) String authorization) {
+        requireAdmin(authorization);
+        try {
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("professors", sqlite.allProfessors());
+            body.put("courses", sqlite.allProfessorCourses());
+            return body;
+        } catch (java.sql.SQLException e) {
+            throw new ApiException(500, "Database error");
+        }
+    }
+
+    @PostMapping("/professor")
+    public Map<String, Object> addProfessor(
+            @RequestBody Map<String, Object> payload,
+            @RequestHeader(value = "Authorization", required = false) String authorization) {
+        requireAdmin(authorization);
+        String name = String.valueOf(payload.getOrDefault("name", "")).trim();
+        String department = String.valueOf(payload.getOrDefault("department", "CSE")).trim();
+        if (name.isEmpty()) {
+            throw new ApiException(400, "'name' is required");
+        }
+        try {
+            int id = sqlite.addProfessor(name, department);
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("ok", true);
+            body.put("id", id);
+            return body;
+        } catch (java.sql.SQLException e) {
+            throw new ApiException(500, "Database error");
+        }
+    }
+
+    @DeleteMapping("/professor/{professorId}")
+    public Map<String, Object> deleteProfessor(
+            @PathVariable int professorId,
+            @RequestHeader(value = "Authorization", required = false) String authorization) {
+        requireAdmin(authorization);
+        try {
+            sqlite.deleteProfessor(professorId);
+        } catch (java.sql.SQLException e) {
+            throw new ApiException(500, "Database error");
+        }
+        return okResponse();
+    }
+
+    @PostMapping("/professor-course")
+    public Map<String, Object> upsertProfessorCourse(
+            @RequestBody Map<String, Object> payload,
+            @RequestHeader(value = "Authorization", required = false) String authorization) {
+        requireAdmin(authorization);
+        Object rawCourse = payload.get("course");
+        if (!(rawCourse instanceof Map)) {
+            throw new ApiException(400, "'course' object required");
+        }
+        try {
+            int id = sqlite.upsertProfessorCourse((Map<?, ?>) rawCourse);
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("ok", true);
+            body.put("id", id);
+            return body;
+        } catch (java.sql.SQLException e) {
+            throw new ApiException(500, "Database error");
+        }
+    }
+
+    @DeleteMapping("/professor-course/{courseId}")
+    public Map<String, Object> deleteProfessorCourse(
+            @PathVariable int courseId,
+            @RequestHeader(value = "Authorization", required = false) String authorization) {
+        requireAdmin(authorization);
+        try {
+            sqlite.deleteProfessorCourse(courseId);
+        } catch (java.sql.SQLException e) {
+            throw new ApiException(500, "Database error");
+        }
+        return okResponse();
+    }
+
     private void requireAdmin(String authorization) {
         if (authorization == null || authorization.isBlank()) {
             throw new ApiException(401, "Missing authorization header");

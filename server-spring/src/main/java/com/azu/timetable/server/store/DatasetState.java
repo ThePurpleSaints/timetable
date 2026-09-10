@@ -140,6 +140,7 @@ public class DatasetState {
                     sqlite.importJson(connection, dataset);
                 }
                 seedCalendar(connection);
+                seedProfessors(connection);
             }
         } catch (Exception failure) {
             LOG.log(java.util.logging.Level.SEVERE, "Database seeding failed", failure);
@@ -158,6 +159,16 @@ public class DatasetState {
             }
         } catch (Exception failure) {
             LOG.log(java.util.logging.Level.SEVERE, "Calendar seeding failed", failure);
+        }
+    }
+
+    private void seedProfessors(java.sql.Connection connection) {
+        try {
+            String department = String.valueOf(dataset.getOrDefault("department", "CSE")).trim();
+            sqlite.seedProfessors(connection, department);
+            LOG.info("Professor seeding complete");
+        } catch (Exception failure) {
+            LOG.log(java.util.logging.Level.SEVERE, "Professor seeding failed", failure);
         }
     }
 

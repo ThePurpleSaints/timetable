@@ -85,6 +85,22 @@ public class SqliteStore {
             );
 
             CREATE INDEX IF NOT EXISTS idx_calendar_schedule_date ON calendar_events(schedule_id, event_date);
+
+            CREATE TABLE IF NOT EXISTS professors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                department TEXT NOT NULL DEFAULT 'CSE'
+            );
+
+            CREATE TABLE IF NOT EXISTS professor_courses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                professor_id INTEGER NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
+                class_id TEXT NOT NULL,
+                course_code TEXT NOT NULL,
+                course_name TEXT NOT NULL DEFAULT '',
+                room TEXT,
+                UNIQUE(professor_id, class_id, course_code)
+            );
             """;
 
     private static final Pattern LAB_GROUPS = Pattern.compile("\\(((?:L\\d+)(?:,\\s*L\\d+)*)\\)$");
@@ -344,6 +360,12 @@ public class SqliteStore {
                 calendarEvents.add(event);
             }
             snapshot.put("calendar", calendarEvents);
+            snapshot.put("professors", select(connection, "SELECT * FROM professors ORDER BY department, name"));
+            snapshot.put("professorCourses", select(connection,
+                    "SELECT pc.*, p.name AS professor_name, p.department "
+                            + "FROM professor_courses pc "
+                            + "JOIN professors p ON p.id = pc.professor_id "
+                            + "ORDER BY pc.class_id, pc.course_code"));
             return snapshot;
         }
     }
@@ -523,6 +545,129 @@ public class SqliteStore {
         try (Connection connection = connect()) {
             ensureSchema(connection);
             execute(connection, "DELETE FROM calendar_events WHERE id = ?", id);
+        }
+    }
+
+    // ---------- professors -------------------------------------------------
+
+    public void seedProfessors(Connection connection, String department) throws SQLException {
+        ensureSchema(connection);
+        Map<String, Object> count = selectOne(connection, "SELECT COUNT(*) AS n FROM professors");
+        if (toInt(count.get("n")) > 0) {
+            return;
+        }
+        List<Map<String, Object>> rows = select(connection,
+                "SELECT section_id, course_code, course_name, room, in_charge "
+                        + "FROM schedule "
+                        + "WHERE course_code IS NOT NULL AND course_code != '' "
+                        + "AND in_charge IS NOT NULL AND in_charge != '' "
+                        + "GROUP BY section_id, course_code, in_charge");
+        Map<String, Integer> nameToId = new LinkedHashMap<>();
+        for (Map<String, Object> row : rows) {
+            String name = String.valueOf(row.get("in_charge"));
+            if (!nameToId.containsKey(name)) {
+                execute(connection,
+                        "INSERT INTO professors (name, department) VALUES (?, ?)",
+                        name, department);
+                Map<String, Object> inserted = selectOne(connection,
+                        "SELECT id FROM professors WHERE name = ? AND department = ?",
+                        name, department);
+                nameToId.put(name, toInt(inserted.get("id")));
+            }
+            int professorId = nameToId.get(name);
+            execute(connection,
+                    "INSERT OR IGNORE INTO professor_courses "
+                            + "(professor_id, class_id, course_code, course_name, room) "
+                            + "VALUES (?, ?, ?, ?, ?)",
+                    professorId,
+                    String.valueOf(row.get("section_id")),
+                    String.valueOf(row.get("course_code")),
+                    String.valueOf(row.get("course_name")),
+                    nullableString(row.get("room")));
+        }
+    }
+
+    public List<Map<String, Object>> allProfessors() throws SQLException {
+        try (Connection connection = connect()) {
+            ensureSchema(connection);
+            return select(connection, "SELECT * FROM professors ORDER BY department, name");
+        }
+    }
+
+    public List<Map<String, Object>> allProfessorCourses() throws SQLException {
+        try (Connection connection = connect()) {
+            ensureSchema(connection);
+            return select(connection,
+                    "SELECT pc.*, p.name AS professor_name, p.department "
+                            + "FROM professor_courses pc "
+                            + "JOIN professors p ON p.id = pc.professor_id "
+                            + "ORDER BY p.department, p.name, pc.class_id, pc.course_code");
+        }
+    }
+
+    public int addProfessor(String name, String department) throws SQLException {
+        try (Connection connection = connect()) {
+            ensureSchema(connection);
+            execute(connection,
+                    "INSERT INTO professors (name, department) VALUES (?, ?)",
+                    name, department);
+            Map<String, Object> row = selectOne(connection,
+                    "SELECT id FROM professors WHERE name = ? AND department = ?",
+                    name, department);
+            return toInt(row.get("id"));
+        }
+    }
+
+    public void deleteProfessor(int id) throws SQLException {
+        try (Connection connection = connect()) {
+            ensureSchema(connection);
+            execute(connection, "DELETE FROM professors WHERE id = ?", id);
+        }
+    }
+
+    public int upsertProfessorCourse(Map<?, ?> course) throws SQLException {
+        try (Connection connection = connect()) {
+            ensureSchema(connection);
+            Object id = course.get("id");
+            int professorId = toInt(course.get("professorId"));
+            String classId = String.valueOf(course.get("classId"));
+            String courseCode = String.valueOf(course.get("courseCode"));
+            Object rawName = course.get("courseName");
+            String courseName = rawName == null ? "" : String.valueOf(rawName);
+            String room = nullableString(course.get("room"));
+
+            if (id != null) {
+                execute(connection,
+                        "UPDATE professor_courses SET professor_id=?, class_id=?, "
+                                + "course_code=?, course_name=?, room=? WHERE id=?",
+                        professorId, classId, courseCode, courseName, room, toInt(id));
+                return toInt(id);
+            }
+            Map<String, Object> existing = selectOne(connection,
+                    "SELECT id FROM professor_courses "
+                            + "WHERE professor_id=? AND class_id=? AND course_code=?",
+                    professorId, classId, courseCode);
+            if (existing != null) {
+                execute(connection,
+                        "UPDATE professor_courses SET course_name=?, room=? WHERE id=?",
+                        courseName, room, toInt(existing.get("id")));
+                return toInt(existing.get("id"));
+            }
+            execute(connection,
+                    "INSERT INTO professor_courses "
+                            + "(professor_id, class_id, course_code, course_name, room) "
+                            + "VALUES (?, ?, ?, ?, ?)",
+                    professorId, classId, courseCode, courseName, room);
+            Map<String, Object> inserted = selectOne(connection,
+                    "SELECT last_insert_rowid() AS id");
+            return toInt(inserted.get("id"));
+        }
+    }
+
+    public void deleteProfessorCourse(int id) throws SQLException {
+        try (Connection connection = connect()) {
+            ensureSchema(connection);
+            execute(connection, "DELETE FROM professor_courses WHERE id = ?", id);
         }
     }
 

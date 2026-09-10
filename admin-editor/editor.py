@@ -30,7 +30,27 @@ from tkinter import messagebox, simpledialog, ttk
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 DEV_TOKEN = os.environ.get("TIMETABLE_ADMIN_TOKEN", "insecure-development-token")
 
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".timetable_admin_editor.json")
+
 META_FIELDS = ["timetableId", "academicYear", "department", "semester", "year"]
+
+
+def _load_config():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _save_config(updated):
+    cfg = _load_config()
+    cfg.update(updated)
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh)
+    except Exception:
+        pass
 
 
 class Api:
@@ -45,6 +65,11 @@ class Api:
         if self.token:
             req.add_header("Authorization", "Bearer " + self.token)
         req.add_header("Content-Type", "application/json")
+        req.add_header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+        )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return json.loads(resp.read().decode("utf-8"))
@@ -82,13 +107,16 @@ class EditorApp:
 
     # ---------- UI scaffolding -------------------------------------------
     def _build_connection_bar(self, initial_url, initial_token):
+        cfg = _load_config()
         bar = ttk.Frame(self.root, padding=6)
         bar.pack(fill="x")
         ttk.Label(bar, text="Server:").pack(side="left")
-        self.server_var = tk.StringVar(value=initial_url or self.api.base)
+        self.server_var = tk.StringVar(value=initial_url or cfg.get("url") or self.api.base)
         ttk.Entry(bar, textvariable=self.server_var, width=30).pack(side="left", padx=4)
         ttk.Label(bar, text="Token:").pack(side="left")
-        self.token_var = tk.StringVar(value=os.environ.get("TIMETABLE_ADMIN_TOKEN", initial_token or DEV_TOKEN))
+        self.token_var = tk.StringVar(
+            value=initial_token or os.environ.get("TIMETABLE_ADMIN_TOKEN") or cfg.get("token") or DEV_TOKEN
+        )
         self.token_entry = ttk.Entry(bar, textvariable=self.token_var, width=24, show="*")
         self.token_entry.pack(side="left", padx=4)
         ttk.Button(bar, text="Show", command=self._toggle_token_show).pack(side="left")
@@ -106,13 +134,16 @@ class EditorApp:
         self.tab_timetable = ttk.Frame(self.notebook)
         self.tab_calendar = ttk.Frame(self.notebook)
         self.tab_overrides = ttk.Frame(self.notebook)
+        self.tab_professors = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_timetable, text="Timetable")
         self.notebook.add(self.tab_calendar, text="Calendar")
         self.notebook.add(self.tab_overrides, text="Overrides")
+        self.notebook.add(self.tab_professors, text="Professors")
 
         self._build_timetable_tab()
         self._build_calendar_tab()
         self._build_overrides_tab()
+        self._build_professors_tab()
 
     def _build_log(self):
         self.log = tk.Text(self.root, height=6, state="disabled", bg="#111", fg="#7CFC00")
@@ -188,15 +219,34 @@ class EditorApp:
         region = self.grid.identify("region", _event.x, _event.y)
         if region != "cell":
             return
+        iid = self.grid.identify_row(_event.y)
+        if not iid:
+            return
+        row = self.grid.index(iid)
         col = int(self.grid.identify_column(_event.x).lstrip("#")) - 1
-        row = int(self.grid.identify_row(_event.y))
-        if col == 0 or col > 7:  # ignore # / Time columns
+        if col < 2 or col > 7:  # ignore # / Time columns
             return
         day = DAYS[col - 1]
         cell = self._cell_at(day, row)
         if not cell:
             return
-        edited = _edit_cell_dialog(self.root, self.section["sectionId"], day, row, cell, row)
+        suggestions = []
+        if hasattr(self, "_prof_courses"):
+            seen = set()
+            for mapping in self._prof_courses:
+                if mapping.get("class_id") != self.section["sectionId"]:
+                    continue
+                code = mapping.get("course_code")
+                if not code or code in seen:
+                    continue
+                seen.add(code)
+                suggestions.append({
+                    "courseCode": code,
+                    "courseName": mapping.get("course_name", ""),
+                    "room": mapping.get("room"),
+                    "inCharge": mapping.get("professor_name"),
+                })
+        edited = _edit_cell_dialog(self.root, self.section["sectionId"], day, row, cell, row, suggestions)
         if edited is not None:
             body = {
                 "sectionId": self.section["sectionId"],
@@ -498,6 +548,246 @@ class EditorApp:
             self.log_line(f"Deleted override #{override_id}")
             self.connect(reload_only=True)
 
+    # ---------- Professors tab --------------------------------------------
+    def _build_professors_tab(self):
+        outer = ttk.Frame(self.tab_professors, padding=6)
+        outer.pack(fill="both", expand=True)
+
+        top = ttk.Frame(outer)
+        top.pack(fill="x", pady=(0, 4))
+        ttk.Label(top, text="Department:").pack(side="left")
+        self.prof_dept = ttk.Combobox(top, width=30, state="readonly")
+        self.prof_dept.pack(side="left", padx=4)
+        self.prof_dept.bind("<<ComboboxSelected>>", lambda _e: self._prof_department_changed())
+        ttk.Label(top, text="Class:").pack(side="left", padx=(12, 0))
+        self.prof_class = ttk.Combobox(top, width=8, state="readonly")
+        self.prof_class.pack(side="left", padx=4)
+        self.prof_class.bind("<<ComboboxSelected>>", lambda _e: self._prof_class_changed())
+
+        pane = ttk.PanedWindow(outer, orient="horizontal")
+        pane.pack(fill="both", expand=True)
+
+        left = ttk.LabelFrame(pane, text="Professors in department", padding=4)
+        self.professors_list = tk.Listbox(left, height=14)
+        self.professors_list.pack(fill="both", expand=True, pady=2)
+        self.professors_list.bind("<Double-1>", lambda _e: self._add_prof_course_dialog())
+        left_buttons = ttk.Frame(left)
+        left_buttons.pack(fill="x")
+        ttk.Button(left_buttons, text="Add professor...", command=self._add_professor_dialog).pack(side="left")
+        ttk.Button(left_buttons, text="Remove professor", command=self._remove_professor).pack(side="left", padx=4)
+        pane.add(left)
+
+        right = ttk.LabelFrame(pane, text="Courses for class (select a course code to fill timetable cells)",
+                               padding=4)
+        self.prof_courses_list = tk.Listbox(right, height=14)
+        self.prof_courses_list.pack(fill="both", expand=True, pady=2)
+        self.prof_courses_list.bind("<Double-1>", lambda _e: self._add_prof_course_dialog())
+        right_buttons = ttk.Frame(right)
+        right_buttons.pack(fill="x")
+        ttk.Button(right_buttons, text="Add course...", command=self._add_prof_course_dialog).pack(side="left")
+        ttk.Button(right_buttons, text="Edit course", command=self._add_prof_course_dialog).pack(side="left", padx=4)
+        ttk.Button(right_buttons, text="Remove course", command=self._remove_prof_course).pack(side="left", padx=4)
+        pane.add(right)
+
+    def _render_professors(self):
+        depts = sorted({p.get("department") for p in self._professors if p.get("department")})
+        current_dept = self.prof_dept.get() or (depts[0] if depts else "")
+        self.prof_dept["values"] = depts
+        if current_dept in depts:
+            self.prof_dept.set(current_dept)
+        elif depts:
+            self.prof_dept.set(depts[0])
+        classes = sorted({s["sectionId"] for s in self.snapshot["sections"]})
+        current_class = self.prof_class.get() or (classes[0] if classes else "")
+        self.prof_class["values"] = classes
+        if current_class in classes:
+            self.prof_class.set(current_class)
+        elif classes:
+            self.prof_class.set(classes[0])
+        self._render_professors_list()
+        self._render_prof_courses_list()
+
+    def _prof_department_changed(self):
+        self._render_professors_list()
+        self._render_prof_courses_list()
+
+    def _prof_class_changed(self):
+        self._render_prof_courses_list()
+
+    def _selected_department(self):
+        return self.prof_dept.get()
+
+    def _selected_class(self):
+        return self.prof_class.get()
+
+    def _render_professors_list(self):
+        self.professors_list.delete(0, "end")
+        dept = self._selected_department()
+        for prof in self._professors:
+            if dept and prof.get("department") != dept:
+                continue
+            self.professors_list.insert("end", prof.get("name", ""))
+        if self.professors_list.size():
+            self.professors_list.selection_set(0)
+
+    def _mappings_for_class(self, class_id):
+        return [m for m in self._prof_courses
+                if (not class_id or m.get("class_id") == class_id)]
+
+    def _render_prof_courses_list(self):
+        self.prof_courses_list.delete(0, "end")
+        class_id = self._selected_class()
+        for m in self._mappings_for_class(class_id):
+            code = m.get("course_code", "")
+            name = m.get("course_name", "")
+            room = m.get("room") or ""
+            prof = m.get("professor_name", "")
+            extra = f" ({room})" if room else ""
+            self.prof_courses_list.insert("end", f"{code}  {name}  ->  {prof}{extra}")
+
+    def _add_professor_dialog(self):
+        dept = self._selected_department() or "CSE"
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Add professor")
+        ttk.Label(dialog, text="Name").grid(row=0, column=0, sticky="e", padx=6, pady=3)
+        name_entry = ttk.Entry(dialog, width=40)
+        name_entry.grid(row=0, column=1, padx=6, pady=3)
+        ttk.Label(dialog, text="Department").grid(row=1, column=0, sticky="e", padx=6, pady=3)
+        dept_entry = ttk.Entry(dialog, width=40)
+        dept_entry.insert(0, dept)
+        dept_entry.grid(row=1, column=1, padx=6, pady=3)
+        result = []
+
+        def save():
+            name = name_entry.get().strip()
+            if not name:
+                messagebox.showerror("Bad name", "Name is required.")
+                return
+            response = self.api.call(
+                "POST", "/api/v1/admin/professor",
+                {"name": name, "department": dept_entry.get().strip() or "CSE"},
+                self._on_api_error)
+            if response and response.get("ok"):
+                result.append(True)
+                dialog.destroy()
+                self.log_line(f"Added professor {name}")
+                self.connect(reload_only=True)
+
+        ttk.Button(dialog, text="Add", command=save).grid(row=2, column=0, columnspan=2, pady=8)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+        return bool(result)
+
+    def _remove_professor(self):
+        selection = self.professors_list.curselection()
+        if not selection:
+            return
+        name = self.professors_list.get(selection[0])
+        prof = next((p for p in self._professors if p.get("name") == name), None)
+        if not prof:
+            return
+        if not messagebox.askyesno("Remove?", f"Remove professor '{name}' and all their course mappings?"):
+            return
+        response = self.api.call(
+            "DELETE", f"/api/v1/admin/professor/{prof['id']}", on_error=self._on_api_error)
+        if response and response.get("ok"):
+            self.log_line(f"Removed professor {name}")
+            self.connect(reload_only=True)
+
+    def _add_prof_course_dialog(self):
+        class_id = self._selected_class()
+        dept = self._selected_department()
+        professors = [p for p in self._professors
+                      if not dept or p.get("department") == dept]
+        if not professors and dept:
+            professors = self._professors
+        if not professors:
+            messagebox.showinfo("No professors", "Add a professor first.")
+            return
+
+        selection = self.prof_courses_list.curselection()
+        editing = None
+        if selection:
+            line = self.prof_courses_list.get(selection[0])
+            code = line.split("  ")[0]
+            editing = next((m for m in self._mappings_for_class(class_id)
+                            if m.get("course_code") == code), None)
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Edit professor course mapping")
+        names = [p.get("name") for p in professors]
+        default_prof = editing.get("professor_name") if editing else professors[0].get("name")
+        default_prof = default_prof if default_prof in names else names[0]
+
+        fields = {"professor": ("Professor", names), "classId": ("Class", [s["sectionId"] for s in self.snapshot["sections"]]),
+                  "courseCode": ("Course code", None), "courseName": ("Course name", None), "room": ("Room", None)}
+        entries = {}
+        for row, (key, (label, options)) in enumerate(fields.items()):
+            ttk.Label(dialog, text=label).grid(row=row, column=0, sticky="e", padx=6, pady=3)
+            if options is None:
+                entry = ttk.Entry(dialog, width=40)
+            else:
+                entry = ttk.Combobox(dialog, values=options, state="readonly", width=38)
+                entry.set(default_prof if key == "professor" else class_id)
+            entries[key] = entry
+            entry.grid(row=row, column=1, padx=6, pady=3)
+        if editing:
+            entries["courseCode"].insert(0, editing.get("course_code", ""))
+            entries["courseName"].insert(0, editing.get("course_name", ""))
+            entries["room"].insert(0, editing.get("room", ""))
+        result = []
+
+        def save():
+            payload = {key: entries[key].get().strip() for key in fields}
+            if not payload["courseCode"] or not payload["professor"]:
+                messagebox.showerror("Bad mapping", "Professor and course code are required.")
+                return
+            prof = next((p for p in self._professors if p.get("name") == payload["professor"]), None)
+            if not prof:
+                return
+            body = {
+                "professorId": prof["id"],
+                "classId": payload["classId"],
+                "courseCode": payload["courseCode"],
+                "courseName": payload["courseName"],
+                "room": payload["room"],
+            }
+            if editing and editing.get("id"):
+                body["id"] = editing["id"]
+            response = self.api.call("POST", "/api/v1/admin/professor-course",
+                                     {"course": body}, self._on_api_error)
+            if response and response.get("ok"):
+                result.append(True)
+                dialog.destroy()
+                self.log_line(f"Saved mapping {payload['courseCode']} for class {payload['classId']}")
+                self.connect(reload_only=True)
+
+        ttk.Button(dialog, text="Save", command=save).grid(row=len(fields), column=0, columnspan=2, pady=8)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+        return bool(result)
+
+    def _remove_prof_course(self):
+        selection = self.prof_courses_list.curselection()
+        if not selection:
+            return
+        class_id = self._selected_class()
+        line = self.prof_courses_list.get(selection[0])
+        code = line.split("  ")[0]
+        mapping = next((m for m in self._mappings_for_class(class_id)
+                        if m.get("course_code") == code), None)
+        if not mapping:
+            return
+        if not messagebox.askyesno("Remove?", f"Remove mapping for course '{code}'?"):
+            return
+        response = self.api.call(
+            "DELETE", f"/api/v1/admin/professor-course/{mapping['id']}", on_error=self._on_api_error)
+        if response and response.get("ok"):
+            self.log_line(f"Removed mapping for {code}")
+            self.connect(reload_only=True)
+
     # ---------- actions ---------------------------------------------------
     def _on_api_error(self, message):
         self.log_line(f"[error] {message}")
@@ -521,10 +811,11 @@ class EditorApp:
             self.status_var.set("Connected — authentication failed")
             self._on_api_error("401 Unauthorized: invalid admin token")
             return
-        self.status_var.set("Authenticated")
+        self.status_var.set(f"Authenticated [{self.api.base}]")
         self.snapshot = self.api.call("GET", "/api/v1/admin/editor", on_error=self._on_api_error)
         if not self.snapshot:
             return
+        _save_config({"url": self.api.base, "token": self.api.token})
         self.meta = {key: self.snapshot.get(key, "") for key in META_FIELDS}
         self._calendar_events = self.snapshot.get("calendar", [])
         ids = sorted({e.get("scheduleId") for e in self._calendar_events})
@@ -534,11 +825,16 @@ class EditorApp:
         self._refresh_section_list()
         self._render_calendar()
         self._render_overrides()
+        self._professors = self.snapshot.get("professors", [])
+        self._prof_courses = self.snapshot.get("professorCourses", [])
+        self._render_professors()
         timetable_id = self.meta.get("timetableId", "?")
         self.log_line(f"Loaded: {len(self.snapshot['sections'])} sections, "
                       f"timetableId={timetable_id}, "
                       f"calendar events={len(self._calendar_events)}, "
-                      f"overrides={len(self.snapshot.get('overrides', []))}")
+                      f"overrides={len(self.snapshot.get('overrides', []))}, "
+                      f"professors={len(self._professors)}, "
+                      f"course mappings={len(self._prof_courses)}")
 
     def _refresh_section_list(self):
         current = self.section_list.curselection()
@@ -714,9 +1010,17 @@ def _dict_dialog(parent, title, keys, values):
     return result[0] if result else None
 
 
-def _edit_cell_dialog(parent, section, day, ordinal, cell, default_ordinal):
+def _edit_cell_dialog(parent, section, day, ordinal, cell, default_ordinal, suggestions=None):
     dialog = tk.Toplevel(parent)
     dialog.title(f"Edit {section} {day} #{ordinal}")
+    row_offset = 0
+    if suggestions:
+        ttk.Label(dialog, text="Fill from course").grid(row=0, column=0, sticky="e", padx=6, pady=3)
+        autofill = ttk.Combobox(
+            dialog, state="readonly",
+            values=[s["courseCode"] for s in suggestions if s.get("courseCode")], width=48)
+        autofill.grid(row=0, column=1, padx=6, pady=3)
+        row_offset = 1
     fields = {
         "cellType": "type (theory | laboratory | activity | break)",
         "courseName": "course name",
@@ -729,12 +1033,28 @@ def _edit_cell_dialog(parent, section, day, ordinal, cell, default_ordinal):
     }
     entries = {}
     for row, (key, label) in enumerate(fields.items()):
-        ttk.Label(dialog, text=label).grid(row=row, column=0, sticky="e", padx=6, pady=3)
+        ttk.Label(dialog, text=label).grid(row=row + row_offset, column=0, sticky="e", padx=6, pady=3)
         entry = ttk.Entry(dialog, width=48)
         entry.insert(0, "" if cell.get(key) is None else str(cell.get(key)))
-        entry.grid(row=row, column=1, padx=6, pady=3)
+        entry.grid(row=row + row_offset, column=1, padx=6, pady=3)
         entries[key] = entry
     result = []
+
+    if suggestions:
+
+        def fill(_event):
+            selected = autofill.get()
+            match = next((s for s in suggestions if s.get("courseCode") == selected), None)
+            if not match:
+                return
+            for source, key in (("courseCode", "courseCode"),
+                                ("courseName", "courseName"),
+                                ("room", "room"),
+                                ("inCharge", "inCharge")):
+                entries[key].delete(0, "end")
+                entries[key].insert(0, match.get(source) or "")
+
+        autofill.bind("<<ComboboxSelected>>", fill)
 
     def save():
         payload = {key: entries[key].get().strip() for key in fields}
@@ -749,7 +1069,8 @@ def _edit_cell_dialog(parent, section, day, ordinal, cell, default_ordinal):
         result.append(payload)
         dialog.destroy()
 
-    ttk.Button(dialog, text="Save", command=save).grid(row=len(fields), column=0, columnspan=2, pady=8)
+    ttk.Button(dialog, text="Save", command=save).grid(
+        row=len(fields) + row_offset, column=0, columnspan=2, pady=8)
     dialog.transient(parent)
     dialog.grab_set()
     parent.wait_window(dialog)

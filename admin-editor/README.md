@@ -3,17 +3,20 @@
 A proposal-grade desktop tool for managing timetable data through the Spring
 Boot admin API. Pure Python + tkinter (no third-party dependencies).
 
+It auto-connects to `http://localhost:8003` on start (the default token is the
+server's dev default `insecure-development-token`). Override with flags:
+
 ```
-python editor.py
+python editor.py --url http://localhost:8003 --token <admin-token>
 ```
 
-Point it at the server, paste the `TIMETABLE_ADMIN_TOKEN`, hit **Connect**, and
-you can:
+You can:
 
-- browse sections and edit timetable cells (double-click a cell),
-- add / delete cells on any day,
-- manage academic calendar events per schedule,
-- add / cancel on-date overrides.
+- browse sections and edit every timetable cell (double-click a cell),
+- add / delete cells on any day, add new sections, rename sections,
+- edit the dataset headers (timetableId, academic year, department, semester, year),
+- manage academic calendar events per schedule: add, edit, delete, create or clear a whole schedule,
+- add, edit or cancel on-date overrides.
 
 ## The idea it demonstrates: one ID, infinitely scalable
 

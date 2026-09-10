@@ -110,9 +110,11 @@ The raw dataset as plain JSON.
 | Method | Path                   | Purpose                                |
 | ------ | ---------------------- | -------------------------------------- |
 | GET    | `/meta`                | `{"authenticated": bool}` no-throw check |
+| PUT    | `/meta`                | Update dataset headers (timetableId, academicYear, department, semester, year) |
 | GET    | `/editor`              | Full editing snapshot                  |
 | PUT    | `/day`                 | Replace one day's cells for a section  |
 | POST   | `/section`             | Add a section                          |
+| PUT    | `/section/{sectionId}` | Update a section's fields (name, classroom, ...) |
 | PUT    | `/cell`                | Update a cell at `ordinal`             |
 | POST   | `/cell`                | Append a cell, returns new `ordinal`   |
 | DELETE | `/cell`                | `?sectionId&day&ordinal`               |

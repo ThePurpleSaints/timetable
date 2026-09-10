@@ -111,14 +111,59 @@ public class AdminApiController {
         return body;
     }
 
+    @PutMapping("/meta")
+    public Map<String, Object> updateMeta(@RequestBody Map<String, Object> payload,
+                                           @RequestHeader(value = "Authorization", required = false) String authorization) {
+        requireAdmin(authorization);
+        Map<String, Object> working = state.workingCopy();
+        for (String key : List.of("timetableId", "academicYear", "department", "semester", "year")) {
+            if (payload.containsKey(key)) {
+                working.put(key, payload.get(key));
+            }
+        }
+        persist(working);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("ok", true);
+        body.putAll(state.headerMeta());
+        return body;
+    }
+
+    @PutMapping("/section/{sectionId}")
+    public Map<String, Object> updateSection(@PathVariable String sectionId,
+                                             @RequestBody Map<String, Object> payload,
+                                             @RequestHeader(value = "Authorization", required = false) String authorization) {
+        requireAdmin(authorization);
+        String id = lower(String.valueOf(sectionId));
+        Map<String, Object> working = state.workingCopy();
+        for (Object rawSection : (List<?>) working.getOrDefault("sections", List.of())) {
+            Map<String, Object> section = (Map<String, Object>) rawSection;
+            if (lower(String.valueOf(section.getOrDefault("sectionId", ""))).equals(id)) {
+                for (Map.Entry<String, Object> entry : payload.entrySet()) {
+                    if ("sectionId".equals(entry.getKey())) {
+                        continue;
+                    }
+                    section.put(entry.getKey(), entry.getValue());
+                }
+                persist(working);
+                return okResponse();
+            }
+        }
+        throw new ApiException(404, "Section '" + sectionId + "' not found");
+    }
+
     @GetMapping("/editor")
     public Map<String, Object> editorSnapshot(
             @RequestHeader(value = "Authorization", required = false) String authorization) {
         requireAdmin(authorization);
         try {
-            Map<String, Object> snapshot = sqlite.editorSnapshot();
-            snapshot.putAll(state.headerMeta());
-            return snapshot;
+Map<String, Object> snapshot = sqlite.editorSnapshot();
+        snapshot.putAll(state.headerMeta());
+        for (String key : List.of("academicYear", "department", "semester", "year")) {
+            if (state.dataset().containsKey(key)) {
+                snapshot.put(key, state.dataset().get(key));
+            }
+        }
+        return snapshot;
         } catch (java.sql.SQLException e) {
             throw new ApiException(500, "Database error");
         }

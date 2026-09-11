@@ -26,6 +26,7 @@ import re
 import sys
 import threading
 import tkinter as tk
+import traceback
 import urllib.error
 import urllib.request
 from tkinter import messagebox, simpledialog, ttk
@@ -134,11 +135,12 @@ class EditorApp:
         self.section = None
         self._editing_event_id = None
         self._editing_override_id = None
-        self.override_id_holder = None
         self._connect_seq = 0
 
         root.title("Timetable Admin Editor")
         root.geometry("1020x700")
+
+        self._first_connect = True
 
         self._build_connection_bar(initial_url, initial_token)
         self._build_notebook()
@@ -147,13 +149,20 @@ class EditorApp:
         root.after(250, self.connect)
 
     def _drain_worker_queue(self):
+        """Run API callbacks on the Tk main thread; never let one break the pump."""
         try:
             while True:
                 fn, args = self.api._queue.get_nowait()
-                fn(*args)
+                try:
+                    fn(*args)
+                except Exception:  # noqa: BLE001 - keep the pump alive
+                    traceback.print_exc()
         except queue.Empty:
             pass
-        self.root.after(50, self._drain_worker_queue)
+        try:
+            self.root.after(50, self._drain_worker_queue)
+        except Exception:  # noqa: BLE001 - window may already be closing
+            pass
 
     # ---------- UI scaffolding -------------------------------------------
     def _build_connection_bar(self, initial_url, initial_token):
@@ -208,8 +217,9 @@ class EditorApp:
         self.log.pack(fill="x", padx=6, pady=4)
 
     def log_line(self, text):
+        stamp = datetime.datetime.now().strftime("%H:%M:%S")
         self.log.config(state="normal")
-        self.log.insert("end", text + "\n")
+        self.log.insert("end", f"[{stamp}] {text}\n")
         self.log.see("end")
         self.log.config(state="disabled")
 
@@ -304,7 +314,7 @@ class EditorApp:
                     "room": mapping.get("room"),
                     "inCharge": mapping.get("professor_name"),
                 })
-        edited = _edit_cell_dialog(self.root, self.section["sectionId"], day, row, cell, row, suggestions)
+        edited = _edit_cell_dialog(self.root, self.section["sectionId"], day, row, cell, suggestions)
         if edited is not None:
             body = {
                 "sectionId": self.section["sectionId"],
@@ -923,7 +933,16 @@ class EditorApp:
         self.api.async_call(
             "GET", "/api/v1/admin/meta",
             on_done=lambda probe: self._on_meta(probe, seq),
-            on_error=self._on_api_error)
+            on_error=lambda m: self._connect_error(m, seq))
+
+    def _connect_error(self, message, seq):
+        if seq != self._connect_seq:
+            return
+        self.status_var.set("Connection failed")
+        if self._first_connect:
+            self.log_line(f"[error] {message}")
+        else:
+            self._on_api_error(message)
 
     def _on_meta(self, probe, seq):
         if seq != self._connect_seq:
@@ -939,13 +958,14 @@ class EditorApp:
         self.api.async_call(
             "GET", "/api/v1/admin/editor",
             on_done=lambda snapshot: self._on_snapshot(snapshot, seq),
-            on_error=self._on_api_error)
+            on_error=lambda m: self._connect_error(m, seq))
 
     def _on_snapshot(self, snapshot, seq):
         if seq != self._connect_seq:
             return
         if not snapshot:
             return
+        self._first_connect = False
         self.snapshot = snapshot
         _save_config({"url": self.api.base, "token": self.api.token})
         self.meta = {key: self.snapshot.get(key, "") for key in META_FIELDS}
@@ -1140,16 +1160,6 @@ def _short_cell_label(cell):
     return f"{label}{(' · ' + room) if room else ''}"
 
 
-def _cell_label(cell):
-    if cell.get("cellType") == "break":
-        return f"[break] {cell.get('courseName', '')}"
-    if cell.get("cellType") == "activity":
-        return f"[{cell.get('activity', '')}] {cell.get('room', '')}"
-    text = cell.get("courseName") or cell.get("courseCode") or ""
-    room = cell.get("room") or ""
-    return f"{text}  ({room})"
-
-
 def text_choice(parent, title, prompt, choices):
     dialog = tk.Toplevel(parent)
     dialog.title(title)
@@ -1192,7 +1202,7 @@ def _dict_dialog(parent, title, keys, values):
     return result[0] if result else None
 
 
-def _edit_cell_dialog(parent, section, day, ordinal, cell, default_ordinal, suggestions=None):
+def _edit_cell_dialog(parent, section, day, ordinal, cell, suggestions=None):
     dialog = tk.Toplevel(parent)
     dialog.title(f"Edit {section} {day} #{ordinal}")
     row_offset = 0

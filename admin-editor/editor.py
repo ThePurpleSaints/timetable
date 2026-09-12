@@ -166,7 +166,7 @@ class EditorApp:
         self._connect_seq = 0
         self._dirty_cells = {}        # (sectionId, day, ordinal) -> staged operation dict
         self._dirty_order = []        # insertion order of staged cell edits
-        self._selected_cell = None    # (iid, day, ordinal) of the last-clicked cell
+        self._selected_cells = []     # list of (iid, day, ordinal) highlighted cells
         self._overlay = None          # highlight frame for the clicked cell
 
         root.title("Timetable Admin Editor")
@@ -288,7 +288,7 @@ class EditorApp:
         right = ttk.Frame(pane)
         head = ttk.Frame(right)
         head.pack(fill="x", padx=4)
-        ttk.Label(head, text="Schedule grid â€” click a cell, double-click to edit").pack(side="left")
+        ttk.Label(head, text="Click a cell to select; Ctrl+click to multi-select; double-click to edit").pack(side="left")
         self.save_button = ttk.Button(head, text="SAVE CHANGES", state="disabled",
                                       command=self._flush_saves)
         self.save_button.pack(side="right", padx=(6, 0))
@@ -300,7 +300,7 @@ class EditorApp:
         self.grid.bind("<Double-1>", self._on_cell_double)
         self.grid.bind("<Button-1>", self._on_cell_click)
         ttk.Button(right, text="Add cell to selected day", command=self.add_cell).pack(fill="x", padx=4, pady=2)
-        ttk.Button(right, text="Delete selected cell", command=self.delete_cell).pack(fill="x", padx=4, pady=2)
+        ttk.Button(right, text="Delete selected cells", command=self.delete_cell).pack(fill="x", padx=4, pady=2)
         pane.add(right, weight=3)
 
     def _section_meta(self, section):
@@ -344,7 +344,7 @@ class EditorApp:
 
     def _render_grid(self, section):
         self._clear_overlay()
-        self._selected_cell = None
+        self._selected_cells = []
         weekly = section.get("weeklyTimetable", {}) or {}
         self.grid.delete(*self.grid.get_children())
         self.grid["columns"] = [f"c{i}" for i in range(9)]
@@ -363,7 +363,7 @@ class EditorApp:
                 values.append(_short_cell_label(cells[row]) if row < len(cells) else "")
             self.grid.insert("", "end", values=values)
 
-    # ---- single-cell click highlight ----
+    # ---- cell click / multi-select highlight ----
     def _on_cell_click(self, _event):
         region = self.grid.identify("region", _event.x, _event.y)
         if region != "cell":
@@ -376,13 +376,33 @@ class EditorApp:
             return
         row = self.grid.index(iid)
         day = DAYS[col - 2]
-        self._selected_cell = (iid, day, row)
-        self._clear_overlay()
-        if self._cell_at(day, row):
-            self._place_overlay(iid, col)
+        ctrl = bool(_event.state & 0x0004)
+        if ctrl:
+            selected = [s for s in self._selected_cells if s[1] == day and s[2] == row]
+            if selected:
+                self._selected_cells.remove(selected[0])
+            elif self._cell_at(day, row):
+                self._selected_cells.append((iid, day, row))
+        elif self._cell_at(day, row):
+            self._selected_cells = [(iid, day, row)]
+        else:
+            self._selected_cells = []
+        self._apply_highlights()
         return "break"
 
-    def _place_overlay(self, iid, col):
+    def _apply_highlights(self):
+        self._clear_overlay()
+        self._overlay = []
+        for _iid, day, row in self._selected_cells:
+            if not self._cell_at(day, row):
+                continue
+            children = self.grid.get_children()
+            if row >= len(children):
+                continue
+            col = DAYS.index(day) + 2
+            self._place_overlay(children[row], col, clear=False)
+
+    def _place_overlay(self, iid, col, clear=True):
         try:
             bbox = self.grid.bbox(iid, col)
         except Exception:
@@ -392,8 +412,11 @@ class EditorApp:
         bx, by, bw, bh = bbox
         t = 3
         accent = "#1f6feb"
-        self._clear_overlay()
-        self._overlay = []
+        if clear:
+            self._clear_overlay()
+            self._overlay = []
+        elif self._overlay is None:
+            self._overlay = []
         # Four thin strips drawn just OUTSIDE the cell edges, so the cell text
         # stays visible under the highlight.
         for (x, y, w, h) in (
@@ -423,7 +446,7 @@ class EditorApp:
         except Exception:
             return
         col = DAYS.index(day) + 2
-        self._selected_cell = (iid, day, ordinal)
+        self._selected_cells = [(iid, day, ordinal)]
         if self._cell_at(day, ordinal):
             self._place_overlay(iid, col)
 
@@ -472,23 +495,34 @@ class EditorApp:
         self._render_grid(self.section)
         self._restore_cell_highlight(day, len(cells) - 1)
 
-    def _stage_cell_delete(self, day, row):
+    def _stage_cell_deletes(self, plan):
+        """Stage DELETE ops for the given [(day, row)] cells and flush them.
+
+        Rows are deleted highest-first within each day so the remaining
+        ordinals on both the grid and the server stay valid."""
         weekly = self.section.setdefault("weeklyTimetable", {})
-        cells = weekly.setdefault(day, [])
-        if 0 <= row < len(cells):
-            cells.pop(row)
-        key = (self.section["sectionId"], day, row)
-        self._clean_dirty_key(key)
-        self._dirty_cells[key] = {
-            "method": "DELETE",
-            "path": ("/api/v1/admin/cell?" + urllib.parse.urlencode({
-                "sectionId": self.section["sectionId"], "day": day, "ordinal": row})),
-            "body": None,
-        }
-        self._dirty_order.append(key)
+        by_day = {}
+        for day, row in plan:
+            by_day.setdefault(day, []).append(row)
+        for day, rows in by_day.items():
+            cells = weekly.setdefault(day, [])
+            for row in sorted(rows, reverse=True):
+                if 0 <= row < len(cells):
+                    cells.pop(row)
+                key = (self.section["sectionId"], day, row)
+                self._clean_dirty_key(key)
+                self._dirty_cells[key] = {
+                    "method": "DELETE",
+                    "path": ("/api/v1/admin/cell?" + urllib.parse.urlencode({
+                        "sectionId": self.section["sectionId"], "day": day, "ordinal": row})),
+                    "body": None,
+                }
+                self._dirty_order.append(key)
         self._mark_dirty()
         self._render_grid(self.section)
         self._clear_overlay()
+        self._selected_cells = []
+        self._flush_saves()
 
     def _clean_dirty_key(self, key):
         """Drop any staged op that used the same (section, day, ordinal) before adding a new one."""
@@ -1553,19 +1587,30 @@ class EditorApp:
     def delete_cell(self):
         if not self.section:
             return
-        if self._selected_cell is None:
-            messagebox.showinfo("Nothing selected", "Click a cell first.")
+        if not self._selected_cells:
+            messagebox.showinfo("Nothing selected", "Click a cell (or Ctrl+click several) first.")
             return
-        _iid, day, row = self._selected_cell
-        if not self._cell_at(day, row):
+        plan = []
+        seen = set()
+        for _iid, day, row in list(self._selected_cells):
+            if day not in DAYS or not self._cell_at(day, row):
+                continue
+            if (day, row) not in seen:
+                seen.add((day, row))
+                plan.append((day, row))
+        if not plan:
+            messagebox.showinfo("Nothing selected", "The selected cells are empty; nothing to delete.")
             return
-        if not messagebox.askyesno(
-                "Delete cell?",
-                f"Delete {self.section['sectionName']} {day} #{row} "
-                f"({_short_cell_label(self._cell_at(day, row))})?"):
+        if len(plan) == 1:
+            day, row = plan[0]
+            prompt = (f"Delete {self.section['sectionName']} {day} #{row} "
+                      f"({_short_cell_label(self._cell_at(day, row))})?")
+        else:
+            prompt = f"Delete {len(plan)} cells from {self.section['sectionName']}?"
+        if not messagebox.askyesno("Delete cells?", prompt):
             return
-        self._stage_cell_delete(day, row)
-        self.log_line(f"Staged delete of {day} #{row} â€” click SAVE CHANGES")
+        self.log_line(f"Deleting {len(plan)} cell(s) ...")
+        self._stage_cell_deletes(plan)
 
 
 # ---------- small helpers ------------------------------------------------

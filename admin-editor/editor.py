@@ -28,6 +28,7 @@ import threading
 import tkinter as tk
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 from tkinter import messagebox, simpledialog, ttk
 
@@ -361,24 +362,31 @@ class EditorApp:
             return
         if not bbox:
             return
-        bg = None
-        try:
-            bg = ttk.Style(self.grid).lookup("Treeview", "background") or "#ffffff"
-        except Exception:
-            bg = "#ffffff"
-        canvas = tk.Canvas(self.grid, highlightthickness=0, bg=bg)
         bx, by, bw, bh = bbox
-        canvas.place(x=bx - 2, y=by - 2, width=bw + 4, height=bh + 4)
-        canvas.create_rectangle(2, 2, bw + 2, bh + 2, outline="#1f6feb", width=2)
-        self._overlay = canvas
+        t = 3
+        accent = "#1f6feb"
+        self._clear_overlay()
+        self._overlay = []
+        # Four thin strips drawn just OUTSIDE the cell edges, so the cell text
+        # stays visible under the highlight.
+        for (x, y, w, h) in (
+            (bx - t, by - t, bw + 2 * t, t),      # top
+            (bx - t, by + bh, bw + 2 * t, t),     # bottom
+            (bx - t, by - t, t, bh + 2 * t),      # left
+            (bx + bw, by - t, t, bh + 2 * t),     # right
+        ):
+            strip = tk.Canvas(self.grid, highlightthickness=0, bg=accent)
+            strip.place(x=int(x), y=int(y), width=int(w), height=int(h))
+            self._overlay.append(strip)
 
     def _clear_overlay(self):
-        if self._overlay is not None:
-            try:
-                self._overlay.destroy()
-            except Exception:
-                pass
-            self._overlay = None
+        if self._overlay:
+            for strip in self._overlay:
+                try:
+                    strip.destroy()
+                except Exception:
+                    pass
+        self._overlay = None
 
     def _restore_cell_highlight(self, day, ordinal):
         if day not in DAYS:
@@ -446,8 +454,8 @@ class EditorApp:
         self._clean_dirty_key(key)
         self._dirty_cells[key] = {
             "method": "DELETE",
-            "path": (f"/api/v1/admin/cell?sectionId={self.section['sectionId']}"
-                     f"&day={day}&ordinal={row}"),
+            "path": ("/api/v1/admin/cell?" + urllib.parse.urlencode({
+                "sectionId": self.section["sectionId"], "day": day, "ordinal": row})),
             "body": None,
         }
         self._dirty_order.append(key)

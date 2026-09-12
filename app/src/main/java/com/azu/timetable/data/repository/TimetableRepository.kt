@@ -44,13 +44,6 @@ class TimetableRepository(
         timetableDao.deleteSlotById(id)
     }
 
-    suspend fun populateDefaultsIfNeeded() {
-        val count = timetableDao.getCount()
-        if (count == 0) {
-            timetableDao.insertSlots(DefaultTimetable.getInitialSlots())
-        }
-    }
-
     suspend fun resetAndInsert(slots: List<TimetableSlot>) {
         timetableDao.clearAll()
         timetableDao.insertSlots(slots)

@@ -141,6 +141,7 @@ public class DatasetState {
                 }
                 seedCalendar(connection);
                 seedProfessors(connection);
+                sqlite.normalizeProfessors(connection);
             }
         } catch (Exception failure) {
             LOG.log(java.util.logging.Level.SEVERE, "Database seeding failed", failure);
@@ -170,6 +171,29 @@ public class DatasetState {
         } catch (Exception failure) {
             LOG.log(java.util.logging.Level.SEVERE, "Professor seeding failed", failure);
         }
+    }
+
+    public static Map<String, Integer> romanOrdinal() {
+        return ROMAN_YEARS;
+    }
+
+    public static String yearFromSectionName(String sectionName) {
+        if (sectionName == null) {
+            return "";
+        }
+        String upper = sectionName.trim().toUpperCase(Locale.ROOT);
+        for (String roman : new String[]{"VIII", "VII", "VI", "IV", "III", "V", "II", "I"}) {
+            if (upper.startsWith(roman)
+                    && (upper.length() == roman.length() || upper.charAt(roman.length()) == ' ')) {
+                return roman;
+            }
+        }
+        java.util.regex.Matcher digit = java.util.regex.Pattern
+                .compile("^([1-8])(?:ST|ND|RD|TH)?\\b").matcher(upper);
+        if (digit.find()) {
+            return digit.group(1);
+        }
+        return "";
     }
 
     static String computeCalendarScheduleId(Map<String, Object> dataset, List<Map<String, Object>> events) {

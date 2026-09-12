@@ -64,6 +64,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
@@ -140,6 +141,8 @@ fun TimetableScreen(
     val use24HourFormat by viewModel.use24HourFormat.collectAsState()
     val calendarGridMode by viewModel.calendarGridMode.collectAsState()
     val showClassSelection by viewModel.showClassSelection.collectAsState()
+    val classDirectory by viewModel.classDirectory.collectAsState()
+    val isRefreshing by viewModel.refreshing.collectAsState()
     val toastMessage by viewModel.toast.collectAsState()
     val overrides by viewModel.overrides.collectAsState()
     val calendarEvents by viewModel.calendarEvents.collectAsState()
@@ -155,6 +158,15 @@ fun TimetableScreen(
     val todayDay = viewModel.todayDayOfWeek
     val formattedCurrentDate = remember {
         SimpleDateFormat("MMMM d", Locale.getDefault()).format(Date()).uppercase()
+    }
+
+    // Class label from the server directory (e.g. "II CSE A"), falling back to
+    // the stored section id while the directory is still loading.
+    val classLabel = remember(classDirectory, selectedClass) {
+        classDirectory?.classes
+            ?.firstOrNull { it.sectionId == selectedClass }
+            ?.sectionName
+            ?: selectedClass
     }
 
     // Precompute slots grouped by day to eliminate allocations during scrolling
@@ -234,7 +246,7 @@ fun TimetableScreen(
                 title = {
                     Column {
                         Text(
-                            text = "$formattedCurrentDate • II CSE $selectedClass",
+                            text = "$formattedCurrentDate • $classLabel",
                             style = MaterialTheme.typography.labelSmall.copy(
                                 fontWeight = FontWeight.Bold,
                                 letterSpacing = 1.2.sp,
@@ -448,18 +460,24 @@ fun TimetableScreen(
                     modifier = Modifier.fillMaxSize()
                 )
             } else if (currentDestination == "Calendar") {
-                CalendarScreen(
-                    calendarEvents = calendarEvents,
-                    slotsByDay = slotsByDay,
-                    overrides = overrides,
-                    sectionId = selectedClass,
-                    use24h = use24HourFormat,
-                    gridMode = calendarGridMode,
-                    onGridModeChange = viewModel::setCalendarGridMode,
-                    resetSignal = scheduleResetSignal,
-                    onDetailChange = { open -> calendarDetailOpen = open },
+                PullToRefreshBox(
+                    isRefreshing = isRefreshing,
+                    onRefresh = { viewModel.refreshAll() },
                     modifier = Modifier.fillMaxSize()
-                )
+                ) {
+                    CalendarScreen(
+                        calendarEvents = calendarEvents,
+                        slotsByDay = slotsByDay,
+                        overrides = overrides,
+                        sectionId = selectedClass,
+                        use24h = use24HourFormat,
+                        gridMode = calendarGridMode,
+                        onGridModeChange = viewModel::setCalendarGridMode,
+                        resetSignal = scheduleResetSignal,
+                        onDetailChange = { open -> calendarDetailOpen = open },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
             } else {
                 // Day selector capsules bar
                 LazyRow(
@@ -522,56 +540,64 @@ fun TimetableScreen(
                 }
 
                 // High-performance Swipeable HorizontalPager
-                HorizontalPager(
-                    state = pagerState,
-                    beyondViewportPageCount = 2,
-                    key = { it },
+                PullToRefreshBox(
+                    isRefreshing = isRefreshing,
+                    onRefresh = { viewModel.refreshAll() },
                     modifier = Modifier
                         .fillMaxSize()
-                        .testTag("day_horizontal_pager")
-                ) { page ->
-                    val dayNumber = page + 1
-                    val isTodayPage = (dayNumber == todayDay)
-                    val daySlots = slotsByDay[dayNumber] ?: emptyList()
+                        .testTag("day_pager_pull_refresh")
+                ) {
+                    HorizontalPager(
+                        state = pagerState,
+                        beyondViewportPageCount = 2,
+                        key = { it },
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .testTag("day_horizontal_pager")
+                    ) { page ->
+                        val dayNumber = page + 1
+                        val isTodayPage = (dayNumber == todayDay)
+                        val daySlots = slotsByDay[dayNumber] ?: emptyList()
 
-                    DaySlotList(
-                        dayName = DayTabs[page].fullName,
-                        dayNumber = dayNumber,
-                        daySlots = daySlots,
-                        todayEvents = todayEvents,
-                        isTodayPage = isTodayPage,
-                        use24h = use24HourFormat,
-                        statusFlow = viewModel.currentStatus,
-                        activeSlotId = activeSlotId,
-                        onEditSlot = {
-                            editingSlot = it
-                            showAddEditDialog = true
-                        },
-                        onDeleteSlot = {
-                            slotToDelete = it
-                        },
-                        onToggleNotification = { targetSlot ->
-                            viewModel.updateSlot(
-                                targetSlot.copy(isNotificationEnabled = !targetSlot.isNotificationEnabled)
-                            )
-                        },
-                        onTestNotification = { targetSlot ->
-                            NotificationHelper.showClassNotification(
-                                context = context,
-                                title = targetSlot.title,
-                                venue = targetSlot.venue,
-                                time = "${targetSlot.startTime} - ${targetSlot.endTime}",
-                                faculty = targetSlot.faculty
-                            )
-                        },
-                        onSendImmediateNextNotification = {
-                            viewModel.sendImmediateNextClassNotification()
-                        },
-                        onAddNewSlot = {
-                            editingSlot = null
-                            showAddEditDialog = true
-                        }
-                    )
+                        DaySlotList(
+                            dayName = DayTabs[page].fullName,
+                            dayNumber = dayNumber,
+                            daySlots = daySlots,
+                            todayEvents = todayEvents,
+                            isTodayPage = isTodayPage,
+                            use24h = use24HourFormat,
+                            statusFlow = viewModel.currentStatus,
+                            activeSlotId = activeSlotId,
+                            onEditSlot = {
+                                editingSlot = it
+                                showAddEditDialog = true
+                            },
+                            onDeleteSlot = {
+                                slotToDelete = it
+                            },
+                            onToggleNotification = { targetSlot ->
+                                viewModel.updateSlot(
+                                    targetSlot.copy(isNotificationEnabled = !targetSlot.isNotificationEnabled)
+                                )
+                            },
+                            onTestNotification = { targetSlot ->
+                                NotificationHelper.showClassNotification(
+                                    context = context,
+                                    title = targetSlot.title,
+                                    venue = targetSlot.venue,
+                                    time = "${targetSlot.startTime} - ${targetSlot.endTime}",
+                                    faculty = targetSlot.faculty
+                                )
+                            },
+                            onSendImmediateNextNotification = {
+                                viewModel.sendImmediateNextClassNotification()
+                            },
+                            onAddNewSlot = {
+                                editingSlot = null
+                                showAddEditDialog = true
+                            }
+                        )
+                    }
                 }
             }
         }
@@ -624,6 +650,7 @@ fun TimetableScreen(
     // Confirm Reset Schedule Dialog — moved to Settings screen
     if (showClassSelection) {
         com.azu.timetable.ui.components.ClassSelectionDialog(
+            directory = classDirectory,
             initialSection = selectedClass,
             onDismiss = { viewModel.setShowClassSelection(false) },
             onClassSelected = {

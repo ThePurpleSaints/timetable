@@ -30,8 +30,8 @@ android {
     applicationId = "com.azu.timetable"
     minSdk = 24
     targetSdk = 36
-    versionCode = 44
-    versionName = "4.4"
+    versionCode = 45
+    versionName = "4.5"
 
     // Server base URL for live data. Set `timetable.baseUrl` in the
     // git-ignored local.properties file to point at your own deployment.

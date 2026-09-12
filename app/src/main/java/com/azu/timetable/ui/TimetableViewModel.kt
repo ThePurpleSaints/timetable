@@ -61,6 +61,22 @@ data class AppUpdate(
     val tag: String
 )
 
+@Immutable
+data class ServerClass(
+    val sectionId: String,
+    val sectionName: String,
+    val classroom: String,
+    val department: String,
+    val year: String
+)
+
+@Immutable
+data class ClassDirectory(
+    val departments: List<String>,
+    val years: List<String>,
+    val classes: List<ServerClass>
+)
+
 class TimetableViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repository: TimetableRepository
@@ -150,12 +166,20 @@ class TimetableViewModel(application: Application) : AndroidViewModel(applicatio
     private val _showClassSelection = MutableStateFlow(!hasChosenClass)
     val showClassSelection: StateFlow<Boolean> = _showClassSelection.asStateFlow()
 
+    // Directory of sections available on the server, used to drive the class
+    // selection dialog instead of a hardcoded list.
+    private val _classDirectory = MutableStateFlow<ClassDirectory?>(null)
+    val classDirectory: StateFlow<ClassDirectory?> = _classDirectory.asStateFlow()
+
+    private val _refreshing = MutableStateFlow(false)
+    val refreshing: StateFlow<Boolean> = _refreshing.asStateFlow()
+
     init {
         val database = AppDatabase.getDatabase(application)
         repository = TimetableRepository(database.timetableDao(), database.dateOverrideDao(), database.calendarEventDao())
 
         viewModelScope.launch {
-            repository.populateDefaultsIfNeeded()
+            fetchClassDirectory()
             scheduleAllActiveAlarms()
             syncTimetableFromServer(_selectedClass.value)
             syncOverridesFromServer(_selectedClass.value)
@@ -242,38 +266,9 @@ class TimetableViewModel(application: Application) : AndroidViewModel(applicatio
         _showClassSelection.value = false
 
         viewModelScope.launch {
-            loadTimetableFromJson(sectionId)
             syncTimetableFromServer(sectionId)
             syncOverridesFromServer(sectionId)
             syncCalendarFromServer(sectionId)
-        }
-    }
-
-    private suspend fun loadTimetableFromJson(sectionId: String) {
-        val newSlots = withContext(Dispatchers.IO) {
-            try {
-                val context = getApplication<Application>()
-                val inputStream = context.assets.open("timetable.json")
-                val jsonString = InputStreamReader(inputStream).use { it.readText() }
-                val sections = JSONObject(jsonString).getJSONArray("sections")
-                var targetSection: JSONObject? = null
-                for (i in 0 until sections.length()) {
-                    val sec = sections.getJSONObject(i)
-                    if (sec.getString("sectionId").equals(sectionId, ignoreCase = true)) {
-                        targetSection = sec
-                        break
-                    }
-                }
-                if (targetSection != null) parseSectionToSlots(targetSection) else emptyList()
-            } catch (e: Exception) {
-                emptyList()
-            }
-        }
-        if (newSlots.isEmpty()) return
-        cancelAllAlarms()
-        repository.resetAndInsert(newSlots)
-        if (_notificationsEnabled.value) {
-            scheduleAllActiveAlarms()
         }
     }
 
@@ -347,6 +342,38 @@ class TimetableViewModel(application: Application) : AndroidViewModel(applicatio
                 null
             }
         }
+
+    private fun jsonStringArray(array: JSONArray?): List<String> {
+        if (array == null) return emptyList()
+        return (0 until array.length()).map { array.getString(it) }
+    }
+
+    private suspend fun fetchClassDirectory() {
+        val json = fetchJson("$SERVER_BASE/api/v1/classes") ?: return
+        val directory = withContext(Dispatchers.IO) {
+            try {
+                val departments = jsonStringArray(json.optJSONArray("departments"))
+                val years = jsonStringArray(json.optJSONArray("years"))
+                val arr = json.optJSONArray("classes") ?: JSONArray()
+                val classes = (0 until arr.length()).map { i ->
+                    val o = arr.getJSONObject(i)
+                    ServerClass(
+                        sectionId = o.optString("sectionId", ""),
+                        sectionName = o.optString("sectionName", ""),
+                        classroom = o.optString("classroom", ""),
+                        department = o.optString("department", ""),
+                        year = o.optString("year", "")
+                    )
+                }
+                ClassDirectory(departments, years, classes)
+            } catch (e: Exception) {
+                null
+            }
+        } ?: return
+        if (directory.classes.isNotEmpty()) {
+            _classDirectory.value = directory
+        }
+    }
 
     private suspend fun syncTimetableFromServer(sectionId: String, force: Boolean = false) {
         try {
@@ -614,10 +641,17 @@ class TimetableViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun refreshAll() {
+        if (_refreshing.value) return
         viewModelScope.launch {
-            syncTimetableFromServer(_selectedClass.value)
-            syncOverridesFromServer(_selectedClass.value)
-            syncCalendarFromServer(_selectedClass.value)
+            _refreshing.value = true
+            try {
+                fetchClassDirectory()
+                syncTimetableFromServer(_selectedClass.value, force = true)
+                syncOverridesFromServer(_selectedClass.value)
+                syncCalendarFromServer(_selectedClass.value)
+            } finally {
+                _refreshing.value = false
+            }
         }
     }
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Timetable Admin Editor
 
@@ -136,6 +136,10 @@ class EditorApp:
         self._editing_event_id = None
         self._editing_override_id = None
         self._connect_seq = 0
+        self._dirty_cells = {}        # (sectionId, day, ordinal) -> staged operation dict
+        self._dirty_order = []        # insertion order of staged cell edits
+        self._selected_cell = None    # (iid, day, ordinal) of the last-clicked cell
+        self._overlay = None          # highlight frame for the clicked cell
 
         root.title("Timetable Admin Editor")
         root.geometry("1020x700")
@@ -230,7 +234,21 @@ class EditorApp:
 
         left = ttk.Frame(pane)
         ttk.Label(left, text="Sections (classes)").pack(anchor="w", padx=4)
-        self.section_list = tk.Listbox(left, width=32)
+        filters = ttk.Frame(left)
+        filters.pack(fill="x", padx=4, pady=(0, 2))
+        ttk.Label(filters, text="Dept:").pack(side="left")
+        self.section_dept_var = tk.StringVar()
+        self.section_dept = ttk.Combobox(filters, textvariable=self.section_dept_var,
+                                         width=12, state="readonly")
+        self.section_dept.pack(side="left", padx=3)
+        self.section_dept.bind("<<ComboboxSelected>>", lambda _e: self._apply_section_filters())
+        ttk.Label(filters, text="Year:").pack(side="left")
+        self.section_year_var = tk.StringVar()
+        self.section_year = ttk.Combobox(filters, textvariable=self.section_year_var,
+                                         width=5, state="readonly")
+        self.section_year.pack(side="left", padx=3)
+        self.section_year.bind("<<ComboboxSelected>>", lambda _e: self._apply_section_filters())
+        self.section_list = tk.Listbox(left, width=34)
         self.section_list.pack(fill="both", expand=True, padx=4, pady=2)
         self.section_list.bind("<<ListboxSelect>>", self._on_section_select)
         ttk.Button(left, text="Reload", command=self.connect).pack(fill="x", padx=4, pady=2)
@@ -241,14 +259,52 @@ class EditorApp:
         right = ttk.Frame(pane)
         head = ttk.Frame(right)
         head.pack(fill="x", padx=4)
-        ttk.Label(head, text="Schedule grid — double-click a cell to edit").pack(side="left")
+        ttk.Label(head, text="Schedule grid â€” click a cell, double-click to edit").pack(side="left")
+        self.save_button = ttk.Button(head, text="SAVE CHANGES", state="disabled",
+                                      command=self._flush_saves)
+        self.save_button.pack(side="right", padx=(6, 0))
+        self.dirty_label = ttk.Label(head, text="", foreground="#b45309")
+        self.dirty_label.pack(side="right", padx=6)
         ttk.Button(head, text="Edit dataset info...", command=self.edit_meta).pack(side="right")
         self.grid = ttk.Treeview(right, columns=(), show="headings")
         self.grid.pack(fill="both", expand=True, padx=4, pady=2)
         self.grid.bind("<Double-1>", self._on_cell_double)
+        self.grid.bind("<Button-1>", self._on_cell_click)
         ttk.Button(right, text="Add cell to selected day", command=self.add_cell).pack(fill="x", padx=4, pady=2)
         ttk.Button(right, text="Delete selected cell", command=self.delete_cell).pack(fill="x", padx=4, pady=2)
         pane.add(right, weight=3)
+
+    def _section_meta(self, section):
+        """Return (year, department) parsed from a section name like 'II CSE A'."""
+        name = (section.get("sectionName") or "").strip()
+        upper = name.upper()
+        roman = ""
+        for token in ("VIII", "VII", "VII", "VI", "IV", "III", "V", "II", "I"):
+            if upper == token or upper.startswith(token + " "):
+                roman = token
+                break
+        rest = upper[len(roman):].strip() if roman else name
+        parts = [w for w in rest.split() if w]
+        if not parts:
+            return roman, ""
+        dept = parts[0]
+        return roman, dept
+
+    def _apply_section_filters(self):
+        self._refresh_section_list()
+
+    def _filtered_sections(self):
+        dept = self.section_dept_var.get()
+        year = self.section_year_var.get()
+        out = []
+        for section in self.snapshot["sections"]:
+            sy, sd = self._section_meta(section)
+            if dept and sd and sd != dept:
+                continue
+            if year and sy and sy != year:
+                continue
+            out.append(section)
+        return out
 
     def _on_section_select(self, _event):
         selection = self.section_list.curselection()
@@ -258,6 +314,8 @@ class EditorApp:
         self._render_grid(self.section)
 
     def _render_grid(self, section):
+        self._clear_overlay()
+        self._selected_cell = None
         weekly = section.get("weeklyTimetable", {}) or {}
         self.grid.delete(*self.grid.get_children())
         self.grid["columns"] = [f"c{i}" for i in range(9)]
@@ -275,6 +333,180 @@ class EditorApp:
                 cells = weekly.get(day, [])
                 values.append(_short_cell_label(cells[row]) if row < len(cells) else "")
             self.grid.insert("", "end", values=values)
+
+    # ---- single-cell click highlight ----
+    def _on_cell_click(self, _event):
+        region = self.grid.identify("region", _event.x, _event.y)
+        if region != "cell":
+            return
+        iid = self.grid.identify_row(_event.y)
+        if not iid:
+            return
+        col = int(self.grid.identify_column(_event.x).lstrip("#")) - 1
+        if col < 2 or col > 8:
+            return
+        row = self.grid.index(iid)
+        day = DAYS[col - 2]
+        self._selected_cell = (iid, day, row)
+        self._clear_overlay()
+        if self._cell_at(day, row):
+            self._place_overlay(iid, col)
+        return "break"
+
+    def _place_overlay(self, iid, col):
+        try:
+            bbox = self.grid.bbox(iid, col)
+        except Exception:
+            return
+        if not bbox:
+            return
+        bg = None
+        try:
+            bg = ttk.Style(self.grid).lookup("Treeview", "background") or "#ffffff"
+        except Exception:
+            bg = "#ffffff"
+        canvas = tk.Canvas(self.grid, highlightthickness=0, bg=bg)
+        bx, by, bw, bh = bbox
+        canvas.place(x=bx - 2, y=by - 2, width=bw + 4, height=bh + 4)
+        canvas.create_rectangle(2, 2, bw + 2, bh + 2, outline="#1f6feb", width=2)
+        self._overlay = canvas
+
+    def _clear_overlay(self):
+        if self._overlay is not None:
+            try:
+                self._overlay.destroy()
+            except Exception:
+                pass
+            self._overlay = None
+
+    def _restore_cell_highlight(self, day, ordinal):
+        if day not in DAYS:
+            return
+        try:
+            iid = self.grid.get_children()[ordinal]
+        except Exception:
+            return
+        col = DAYS.index(day) + 2
+        self._selected_cell = (iid, day, ordinal)
+        if self._cell_at(day, ordinal):
+            self._place_overlay(iid, col)
+
+    # ---- staged cell edits (SAVE CHANGES) ----
+    def _mark_dirty(self):
+        count = len(self._dirty_cells)
+        if count:
+            self.save_button.config(state="normal")
+            self.dirty_label.config(text=f"{count} pending")
+        else:
+            self.save_button.config(state="disabled")
+            self.dirty_label.config(text="")
+
+    def _stage_cell_edit(self, day, row, edited):
+        weekly = self.section.setdefault("weeklyTimetable", {})
+        cells = weekly.setdefault(day, [])
+        while len(cells) <= row:
+            cells.append({"period": len(cells), "cellType": "theory", "courseName": ""})
+        cells[row] = edited
+        key = (self.section["sectionId"], day, row)
+        self._clean_dirty_key(key)
+        self._dirty_cells[key] = {
+            "method": "PUT",
+            "path": "/api/v1/admin/cell",
+            "body": {"sectionId": self.section["sectionId"], "day": day, "ordinal": row, "cell": edited},
+        }
+        self._dirty_order.append(key)
+        self._mark_dirty()
+        self._render_grid(self.section)
+        self._restore_cell_highlight(day, row)
+
+    def _stage_cell_add(self, day, new_cell):
+        weekly = self.section.setdefault("weeklyTimetable", {})
+        cells = weekly.setdefault(day, [])
+        cells.append(new_cell)
+        new_cell["period"] = new_cell.get("period") or len(cells)
+        key = (self.section["sectionId"], day, len(cells) - 1)
+        self._clean_dirty_key(key)
+        self._dirty_cells[key] = {
+            "method": "POST",
+            "path": "/api/v1/admin/cell",
+            "body": {"sectionId": self.section["sectionId"], "day": day, "cell": new_cell},
+        }
+        self._dirty_order.append(key)
+        self._mark_dirty()
+        self._render_grid(self.section)
+        self._restore_cell_highlight(day, len(cells) - 1)
+
+    def _stage_cell_delete(self, day, row):
+        weekly = self.section.setdefault("weeklyTimetable", {})
+        cells = weekly.setdefault(day, [])
+        if 0 <= row < len(cells):
+            cells.pop(row)
+        key = (self.section["sectionId"], day, row)
+        self._clean_dirty_key(key)
+        self._dirty_cells[key] = {
+            "method": "DELETE",
+            "path": (f"/api/v1/admin/cell?sectionId={self.section['sectionId']}"
+                     f"&day={day}&ordinal={row}"),
+            "body": None,
+        }
+        self._dirty_order.append(key)
+        self._mark_dirty()
+        self._render_grid(self.section)
+        self._clear_overlay()
+
+    def _clean_dirty_key(self, key):
+        """Drop any staged op that used the same (section, day, ordinal) before adding a new one."""
+        self._dirty_cells.pop(key, None)
+        if key in self._dirty_order:
+            self._dirty_order.remove(key)
+
+    def _flush_saves(self):
+        pending = [self._dirty_cells[k] for k in self._dirty_order]
+        if not pending:
+            return
+        self.save_button.config(state="disabled")
+        self.dirty_label.config(text=f"saving {len(pending)} ...")
+        # deletes last so their (day, ordinal) targets stay valid on the server
+        ordered = [op for op in pending if op["method"] != "DELETE"] + \
+                  [op for op in pending if op["method"] == "DELETE"]
+        self._flush_next(ordered, 0)
+
+    def _flush_next(self, ordered, index):
+        if index >= len(ordered):
+            self.log_line(f"Saved {len(ordered)} cell change(s)")
+            self._dirty_cells.clear()
+            self._dirty_order.clear()
+            self._mark_dirty()
+            self.reload_after_save()
+            return
+        op = ordered[index]
+        self.api.async_call(
+            op["method"], op["path"], op["body"],
+            on_done=lambda _r, i=index: self._flush_next(ordered, i + 1),
+            on_error=lambda m, i=index: self._flush_failed(ordered, i, m))
+
+    def _flush_failed(self, ordered, index, message):
+        self.log_line(f"[error] save failed at change #{index + 1}: {message}")
+        self._mark_dirty()
+        if messagebox.askretrycancel("Save failed", f"{message}\n\nRetry the remaining changes?"):
+            self._flush_next(ordered, index)
+        else:
+            self._clear_pending_staged()
+
+    def _clear_pending_staged(self):
+        self.log_line("Discarding remaining pending cell changes (server was not modified).")
+        self._dirty_cells.clear()
+        self._dirty_order.clear()
+        self._mark_dirty()
+
+    def reload_after_save(self):
+        if self._dirty_cells:
+            self._flush_saves()
+        else:
+            self._do_reload()
+
+    def _do_reload(self):
+        self.connect(reload_only=True)
 
     def _cell_at(self, day, row):
         weekly = self.section.get("weeklyTimetable", {}) or {}
@@ -316,21 +548,8 @@ class EditorApp:
                 })
         edited = _edit_cell_dialog(self.root, self.section["sectionId"], day, row, cell, suggestions)
         if edited is not None:
-            body = {
-                "sectionId": self.section["sectionId"],
-                "day": day,
-                "ordinal": row,
-                "cell": edited,
-            }
-            self.api.async_call(
-                "PUT", "/api/v1/admin/cell", body,
-                on_done=lambda resp: self._cell_saved(resp, day, row, edited),
-                on_error=self._on_api_error)
-
-    def _cell_saved(self, response, day, row, edited):
-        if response and response.get("ok"):
-            self.log_line(f"Updated {day} #{row}: {edited.get('courseName', '')}")
-            self.connect(reload_only=True)
+            self._stage_cell_edit(day, row, edited)
+            self.log_line(f"Staged {day} #{row}: {edited.get('courseName', '')} â€” click SAVE CHANGES")
 
     # ---------- Calendar tab ---------------------------------------------
     def _build_calendar_tab(self):
@@ -472,7 +691,7 @@ class EditorApp:
             if response and response.get("ok"):
                 action = "saved" if self._editing_event_id is not None else "added"
                 self.log_line(f"{action.title()} event {date} in {schedule}")
-                self.connect(reload_only=True)
+                self.reload_after_save()
         self.api.async_call(
             "POST", "/api/v1/admin/calendar",
             {"scheduleId": schedule, "events": target},
@@ -502,7 +721,7 @@ class EditorApp:
     def _schedule_created(self, response, schedule_id):
         if response and response.get("ok"):
             self.log_line(f"Created schedule {schedule_id}")
-            self.connect(reload_only=True)
+            self.reload_after_save()
             self.schedule_combo.set(schedule_id)
 
     def clear_schedule(self):
@@ -521,7 +740,7 @@ class EditorApp:
     def _schedule_cleared(self, response, schedule):
         if response and response.get("ok"):
             self.log_line(f"Cleared schedule {schedule}")
-            self.connect(reload_only=True)
+            self.reload_after_save()
 
     def delete_event(self):
         selection = self.event_list.curselection()
@@ -539,7 +758,7 @@ class EditorApp:
     def _event_deleted(self, response, event):
         if response and response.get("ok"):
             self.log_line(f"Deleted event {event['id']}")
-            self.connect(reload_only=True)
+            self.reload_after_save()
 
     # ---------- Overrides tab --------------------------------------------
     def _build_overrides_tab(self):
@@ -553,7 +772,7 @@ class EditorApp:
 
         def field(label, col):
             ttk.Label(form, text=label).grid(row=0, column=col, sticky="w")
-        field("Date", 0)
+        field("Date(s)", 0)
         self.ov_date = ttk.Entry(form, width=12)
         self.ov_date.grid(row=0, column=1, padx=4)
         field("Section", 2)
@@ -615,8 +834,13 @@ class EditorApp:
         if period_text and not period_text.isdigit():
             messagebox.showerror("Bad period", "Period must be a number.")
             return
-        override = {
-            "date": self.ov_date.get().strip(),
+        dates = [d for d in re.split(r"[,\s;]+", self.ov_date.get().strip()) if d]
+        if not dates:
+            messagebox.showerror("Missing date", "Date is required (yyyy-mm-dd, comma/space for several).")
+            return
+        if self._editing_override_id is not None:
+            dates = dates[:1]
+        base = {
             "sectionId": self.ov_section.get().strip() or "",
             "period": int(period_text) if period_text else None,
             "courseCode": self.ov_code.get().strip(),
@@ -625,17 +849,21 @@ class EditorApp:
             "cancelled": bool(self.ov_cancelled.get()),
         }
         if self._editing_override_id is not None:
-            override["id"] = self._editing_override_id
+            base["id"] = self._editing_override_id
+        self._save_overrides_seq(dates, base, 0)
+
+    def _save_overrides_seq(self, dates, base, index):
+        if index >= len(dates):
+            self.log_line(f"Saved {len(dates)} override(s)")
+            self.prepare_new_override()
+            self.reload_after_save()
+            return
+        override = dict(base)
+        override["date"] = dates[index]
         self.api.async_call(
             "POST", "/api/v1/admin/override", {"override": override},
-            on_done=lambda response: self._override_saved(response, override),
+            on_done=lambda _r, i=index: self._save_overrides_seq(dates, base, i + 1),
             on_error=self._on_api_error)
-
-    def _override_saved(self, response, override):
-        if response and response.get("ok"):
-            self.log_line(f"Saved override for {override['sectionId'] or '?'} on {override['date']}")
-            self.prepare_new_override()
-            self.connect(reload_only=True)
 
     def delete_override(self):
         selection = self.override_list.curselection()
@@ -653,7 +881,7 @@ class EditorApp:
     def _override_deleted(self, response, override_id):
         if response and response.get("ok"):
             self.log_line(f"Deleted override #{override_id}")
-            self.connect(reload_only=True)
+            self.reload_after_save()
 
     # ---------- Professors tab --------------------------------------------
     def _build_professors_tab(self):
@@ -678,6 +906,7 @@ class EditorApp:
         self.professors_list = tk.Listbox(left, height=14)
         self.professors_list.pack(fill="both", expand=True, pady=2)
         self.professors_list.bind("<Double-1>", lambda _e: self._add_prof_course_dialog())
+        self.professors_list.bind("<<ListboxSelect>>", lambda _e: self._render_professor_details())
         left_buttons = ttk.Frame(left)
         left_buttons.pack(fill="x")
         ttk.Button(left_buttons, text="Add professor...", command=self._add_professor_dialog).pack(side="left")
@@ -695,6 +924,12 @@ class EditorApp:
         ttk.Button(right_buttons, text="Edit course", command=self._add_prof_course_dialog).pack(side="left", padx=4)
         ttk.Button(right_buttons, text="Remove course", command=self._remove_prof_course).pack(side="left", padx=4)
         pane.add(right)
+
+        details = ttk.LabelFrame(outer, text="Professor workload (from the timetable)", padding=4)
+        details.pack(fill="both", expand=True, pady=(4, 0))
+        self.prof_details = tk.Text(details, height=7, state="disabled",
+                                    wrap="none", font=("Consolas", 9))
+        self.prof_details.pack(fill="both", expand=True)
 
     def _render_professors(self):
         depts = sorted({p.get("department") for p in self._professors if p.get("department")})
@@ -736,6 +971,46 @@ class EditorApp:
             self.professors_list.insert("end", prof.get("name", ""))
         if self.professors_list.size():
             self.professors_list.selection_set(0)
+        self._render_professor_details()
+
+    def _render_professor_details(self):
+        text = self.prof_details
+        text.config(state="normal")
+        text.delete("1.0", "end")
+        selection = self.professors_list.curselection()
+        if not selection:
+            text.config(state="disabled")
+            return
+        name = self.professors_list.get(selection[0])
+        prof = next((p for p in getattr(self, "_professors", []) if p.get("name") == name), None)
+        if not prof:
+            text.config(state="disabled")
+            return
+        lines = [f"{name}  ({prof.get('department', '')})"]
+        maps = [m for m in getattr(self, "_prof_courses", []) if m.get("professor_name") == name]
+        if maps:
+            lines.append("Mapped courses:")
+            for m in sorted(maps, key=lambda x: x.get("class_id", "") or ""):
+                lines.append(f"   {m.get('class_id', '?')}: {m.get('course_code', '')} "
+                             f"{m.get('course_name', '')} {('(room ' + str(m.get('room')) + ')') if m.get('room') else ''}")
+        slots = 0
+        for section in self.snapshot.get("sections", []):
+            sname = section.get("sectionName") or section.get("sectionId") or "?"
+            weekly = section.get("weeklyTimetable", {}) or {}
+            for day in DAYS:
+                for cell in weekly.get(day, []):
+                    if (cell.get("inCharge") or "").strip() != name:
+                        continue
+                    slots += 1
+                    course = cell.get("courseName") or cell.get("courseCode") or cell.get("activity") or ""
+                    room = cell.get("room")
+                    period = cell.get("period")
+                    t = cell.get("time")
+                    lines.append(f"   {sname:<10} {day:<9} P{period if period is not None else '?'} "
+                                 f"{(t or ''):<12} {course} {('[' + str(room) + ']') if room else ''}")
+        lines.append(f"Titled classes/slots in timetable: {slots}")
+        text.insert("1.0", "\n".join(lines) + "\n")
+        text.config(state="disabled")
 
     def _mappings_for_class(self, class_id):
         return [m for m in self._prof_courses
@@ -787,7 +1062,7 @@ class EditorApp:
             result.append(True)
             dialog.destroy()
             self.log_line(f"Added professor {name}")
-            self.connect(reload_only=True)
+            self.reload_after_save()
 
     def _remove_professor(self):
         selection = self.professors_list.curselection()
@@ -807,7 +1082,7 @@ class EditorApp:
     def _professor_removed(self, response, name):
         if response and response.get("ok"):
             self.log_line(f"Removed professor {name}")
-            self.connect(reload_only=True)
+            self.reload_after_save()
 
     def _add_prof_course_dialog(self):
         class_id = self._selected_class()
@@ -885,7 +1160,7 @@ class EditorApp:
             result.append(True)
             dialog.destroy()
             self.log_line(f"Saved mapping {payload['courseCode']} for class {payload['classId']}")
-            self.connect(reload_only=True)
+            self.reload_after_save()
 
     def _remove_prof_course(self):
         selection = self.prof_courses_list.curselection()
@@ -908,7 +1183,7 @@ class EditorApp:
     def _prof_course_removed(self, response, code):
         if response and response.get("ok"):
             self.log_line(f"Removed mapping for {code}")
-            self.connect(reload_only=True)
+            self.reload_after_save()
 
     # ---------- actions ---------------------------------------------------
     def _on_api_error(self, message):
@@ -921,6 +1196,10 @@ class EditorApp:
             messagebox.showerror("API error", message)
 
     def connect(self, reload_only=False):
+        if self._dirty_cells and not reload_only:
+            self.log_line("Flushing pending cell changes before reload ...")
+            self._flush_saves()
+            return
         self._connect_seq += 1
         seq = self._connect_seq
         self.api.base = self.server_var.get().strip() or "http://localhost:8003"
@@ -951,7 +1230,7 @@ class EditorApp:
             self.status_var.set("Connection failed")
             return
         if not probe.get("authenticated"):
-            self.status_var.set("Connected — authentication failed")
+            self.status_var.set("Connected â€” authentication failed")
             self._on_api_error("401 Unauthorized: invalid admin token")
             return
         self.status_var.set(f"Authenticated [{self.api.base}]")
@@ -989,16 +1268,38 @@ class EditorApp:
                       f"course mappings={len(self._prof_courses)}")
 
     def _refresh_section_list(self):
-        current = self.section_list.curselection()
+        current_id = None
+        if self.section is not None and self.section.get("sectionId"):
+            current_id = self.section["sectionId"]
+        rows = list(self.snapshot["sections"])
+        years = sorted({self._section_meta(s)[0] for s in rows if self._section_meta(s)[0]},
+                       key=lambda y: (len(y), y))
+        depts = sorted({self._section_meta(s)[1] for s in rows if self._section_meta(s)[1]})
+        self.section_year["values"] = years
+        self.section_dept["values"] = depts
+        if self.section_year_var.get() not in years:
+            self.section_year_var.set("")
+        if self.section_dept_var.get() not in depts:
+            self.section_dept_var.set("")
+        filtered = self._filtered_sections()
         self.section_list.delete(0, "end")
-        for section in self.snapshot["sections"]:
-            self.section_list.insert("end", f"{section['sectionId']}  —  {section['sectionName']}")
-        if self.snapshot["sections"]:
-            index = max(0, current[0] if current else 0)
-            index = min(index, len(self.snapshot["sections"]) - 1)
+        for section in filtered:
+            sy, sd = self._section_meta(section)
+            self.section_list.insert(
+                "end",
+                f"{section['sectionName']:<18} {sd or '?':<5} {section.get('classroom') or ''}")
+        if filtered:
+            index = 0
+            if current_id:
+                for i, section in enumerate(filtered):
+                    if section.get("sectionId") == current_id:
+                        index = i
+                        break
             self.section_list.selection_set(index)
-            self.section = self.snapshot["sections"][index]
+            self.section = filtered[index]
             self._render_grid(self.section)
+        else:
+            self.section = None
 
     def _render_overrides(self):
         self.override_list.delete(0, "end")
@@ -1026,7 +1327,7 @@ class EditorApp:
     def _meta_saved(self, response, edited):
         if response and response.get("ok"):
             self.log_line("Dataset info saved: " + ", ".join(f"{k}={edited[k]}" for k in edited))
-            self.connect(reload_only=True)
+            self.reload_after_save()
 
     # --- section editing ---
     def add_section(self):
@@ -1055,7 +1356,7 @@ class EditorApp:
     def _section_added(self, response, section_id):
         if response and response.get("ok"):
             self.log_line(f"Added section {section_id}")
-            self.connect(reload_only=True)
+            self.reload_after_save()
 
     def rename_section(self):
         if not self.section:
@@ -1074,7 +1375,7 @@ class EditorApp:
     def _section_renamed(self, response, section_id):
         if response and response.get("ok"):
             self.log_line(f"Section {section_id} updated")
-            self.connect(reload_only=True)
+            self.reload_after_save()
 
     # --- cell editing ---
     def add_cell(self):
@@ -1092,38 +1393,25 @@ class EditorApp:
             "room": "",
             "inCharge": "",
         }
-        self.api.async_call(
-            "POST", "/api/v1/admin/cell",
-            {"sectionId": self.section["sectionId"], "day": day, "cell": new_cell},
-            on_done=lambda response: self._cell_added(response, day),
-            on_error=self._on_api_error)
-
-    def _cell_added(self, response, day):
-        if response and response.get("ok"):
-            self.log_line(f"Added cell to {day} (ordinal {response.get('ordinal')})")
-            self.connect(reload_only=True)
+        self._stage_cell_add(day, new_cell)
+        self.log_line(f"Staged new cell in {day} â€” click SAVE CHANGES")
 
     def delete_cell(self):
         if not self.section:
             return
-        selection = self.grid.selection()
-        if not selection:
-            messagebox.showinfo("Nothing selected", "Select a cell row first.")
+        if self._selected_cell is None:
+            messagebox.showinfo("Nothing selected", "Click a cell first.")
             return
-        row = int(self.grid.index(selection[0]))
-        day = text_choice(self.root, "Day", "Delete from which day?", DAYS)
-        if day is None:
+        _iid, day, row = self._selected_cell
+        if not self._cell_at(day, row):
             return
-        self.api.async_call(
-            "DELETE",
-            f"/api/v1/admin/cell?sectionId={self.section['sectionId']}&day={day}&ordinal={row}",
-            on_done=lambda response: self._cell_deleted(response, day, row),
-            on_error=self._on_api_error)
-
-    def _cell_deleted(self, response, day, row):
-        if response and response.get("ok"):
-            self.log_line(f"Deleted {day} #{row}")
-            self.connect(reload_only=True)
+        if not messagebox.askyesno(
+                "Delete cell?",
+                f"Delete {self.section['sectionName']} {day} #{row} "
+                f"({_short_cell_label(self._cell_at(day, row))})?"):
+            return
+        self._stage_cell_delete(day, row)
+        self.log_line(f"Staged delete of {day} #{row} â€” click SAVE CHANGES")
 
 
 # ---------- small helpers ------------------------------------------------
@@ -1152,12 +1440,12 @@ def _short_cell_label(cell):
     room = (cell.get("room") or "").strip()
     if cell.get("cellType") == "break":
         label = _acronym(cell.get("courseName")) or "BREAK"
-        return f"{label}{(' · ' + room) if room else ''}"
+        return f"{label}{(' Â· ' + room) if room else ''}"
     if cell.get("cellType") == "activity":
         label = (cell.get("activity") or "ACT").strip()
         return f"[{label}]{(' ' + room) if room else ''}"
     label = _acronym(cell.get("courseName")) or (cell.get("courseCode") or "").strip() or "?"
-    return f"{label}{(' · ' + room) if room else ''}"
+    return f"{label}{(' Â· ' + room) if room else ''}"
 
 
 def text_choice(parent, title, prompt, choices):

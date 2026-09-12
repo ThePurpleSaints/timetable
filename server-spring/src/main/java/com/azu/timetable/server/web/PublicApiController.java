@@ -61,6 +61,38 @@ public class PublicApiController {
         return body;
     }
 
+    @GetMapping("/api/v1/classes")
+    public Map<String, Object> classes() {
+        Map<String, Object> body = new LinkedHashMap<>(state.headerMeta());
+        String department = String.valueOf(state.dataset().getOrDefault("department", "")).trim();
+        List<Object> years = new ArrayList<>();
+        List<Object> classList = new ArrayList<>();
+        for (Object raw : state.sections()) {
+            Map<String, Object> section = (Map<String, Object>) raw;
+            String sectionId = String.valueOf(section.getOrDefault("sectionId", ""));
+            String sectionName = String.valueOf(section.getOrDefault("sectionName", ""));
+            String year = DatasetState.yearFromSectionName(sectionName);
+            if (!year.isEmpty() && !years.contains(year)) {
+                years.add(year);
+            }
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("sectionId", sectionId);
+            entry.put("sectionName", sectionName);
+            entry.put("classroom", section.getOrDefault("classroom", ""));
+            entry.put("department", department);
+            entry.put("year", year);
+            classList.add(entry);
+        }
+        Map<String, Integer> roman = DatasetState.romanOrdinal();
+        years.sort((a, b) -> Integer.compare(
+                roman.getOrDefault(String.valueOf(a), 99),
+                roman.getOrDefault(String.valueOf(b), 99)));
+        body.put("departments", List.of(department));
+        body.put("years", years);
+        body.put("classes", classList);
+        return body;
+    }
+
     @GetMapping("/api/v1/calendar")
     public Map<String, Object> calendar() {
         Map<String, Object> body = new LinkedHashMap<>();

@@ -550,6 +550,12 @@ public class SqliteStore {
 
     // ---------- professors -------------------------------------------------
 
+    private static final Pattern PROF_NAME_SPLIT =
+            Pattern.compile("(?:\\s+&\\s*|\\s*&+\\s*|\\s*,\\s*|\\s+/\\s*|\\s+\\+\\s*)");
+    private static final Pattern PROF_TITLE = Pattern.compile("(?i)^(dr\\.?|mr\\.?|mrs\\.?|ms\\.?|prof\\.?)\\b");
+    private static final Pattern PROF_JUNK = Pattern.compile(
+            "(?i)(in-charge|centre|center|club|paced|committee|coordinator|self study|\\bgd\\b|\\bseminar\\b)");
+
     public void seedProfessors(Connection connection, String department) throws SQLException {
         ensureSchema(connection);
         Map<String, Object> count = selectOne(connection, "SELECT COUNT(*) AS n FROM professors");
@@ -585,6 +591,66 @@ public class SqliteStore {
                     String.valueOf(row.get("course_name")),
                     nullableString(row.get("room")));
         }
+    }
+
+    /**
+     * Splits combined in-charge strings ("Ms. X & Mr. Y") into individual professors and
+     * removes non-person rows (e.g. "Self Paced", "Club In-Charge"). Idempotent: reruns safely.
+     */
+    public void normalizeProfessors(Connection connection) throws SQLException {
+        ensureSchema(connection);
+        List<Map<String, Object>> all = select(connection,
+                "SELECT id, name, department FROM professors");
+        for (Map<String, Object> prof : all) {
+            int profId = toInt(prof.get("id"));
+            String name = String.valueOf(prof.get("name")).trim();
+            if (name.isEmpty()) {
+                continue;
+            }
+            boolean combined = PROF_NAME_SPLIT.matcher(name).find();
+            boolean junk = !combined && PROF_JUNK.matcher(name).find() && !PROF_TITLE.matcher(name).find();
+            if (!combined && !junk) {
+                continue;
+            }
+            if (junk) {
+                execute(connection, "DELETE FROM professors WHERE id = ?", profId);
+                continue;
+            }
+            List<String> persons = new ArrayList<>();
+            for (String part : PROF_NAME_SPLIT.split(name)) {
+                String person = part.trim();
+                if (person.isEmpty()) {
+                    continue;
+                }
+                boolean junkPart = PROF_JUNK.matcher(person).find() && !PROF_TITLE.matcher(person).find();
+                if (junkPart) {
+                    continue;
+                }
+                persons.add(person);
+            }
+            for (String person : persons) {
+                int pid = resolveProfessor(connection, person, String.valueOf(prof.get("department")));
+                execute(connection,
+                        "INSERT OR IGNORE INTO professor_courses "
+                                + "(professor_id, class_id, course_code, course_name, room) "
+                                + "SELECT ?, class_id, course_code, course_name, room "
+                                + "FROM professor_courses WHERE professor_id = ?",
+                        pid, profId);
+            }
+            execute(connection, "DELETE FROM professors WHERE id = ?", profId);
+        }
+    }
+
+    private int resolveProfessor(Connection connection, String name, String department) throws SQLException {
+        Map<String, Object> existing = selectOne(connection,
+                "SELECT id FROM professors WHERE name = ? AND department = ?", name, department);
+        if (existing != null) {
+            return toInt(existing.get("id"));
+        }
+        execute(connection, "INSERT INTO professors (name, department) VALUES (?, ?)", name, department);
+        Map<String, Object> inserted = selectOne(connection,
+                "SELECT id FROM professors WHERE name = ? AND department = ?", name, department);
+        return toInt(inserted.get("id"));
     }
 
     public List<Map<String, Object>> allProfessors() throws SQLException {

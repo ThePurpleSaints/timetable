@@ -58,6 +58,32 @@ def _save_config(updated):
         pass
 
 
+class _RedirectPreserving(urllib.request.HTTPRedirectHandler):
+    """Follow redirects for write methods (PUT/POST/DELETE) without losing the
+    method or the body. urllib's default handler refuses redirects unless the
+    method is GET/HEAD (or POST on 301/302/303), so a Cloudflare HTTP->HTTPS
+    redirect surfaced as a bare 'HTTP 301' error on DELETE. Keeping the method
+    matches how curl/requests handle 301/302/307/308 (only 303 rules to GET)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        method = req.get_method()
+        headers_map = dict(req.headers)
+        headers_map.pop("Content-Length", None)
+        if code in (301, 302, 307, 308) and method not in ("GET", "HEAD"):
+            redirected = urllib.request.Request(
+                newurl, data=req.data, headers=headers_map,
+                origin_req_host=req.origin_req_host, unverifiable=True)
+            redirected.method = method
+            return redirected
+        if code == 303 and method not in ("GET", "HEAD"):
+            redirected = urllib.request.Request(
+                newurl, headers=headers_map,
+                origin_req_host=req.origin_req_host, unverifiable=True)
+            redirected.method = "GET"
+            return redirected
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class Api:
     def __init__(self, base="http://localhost:8003", token=DEV_TOKEN):
         self.base = base
@@ -66,6 +92,7 @@ class Api:
         self._lock = threading.Lock()
         self._busy = 0
         self._queue = queue.Queue()  # (fn, args) drained on the Tk main thread
+        self._opener = urllib.request.build_opener(_RedirectPreserving())
 
     def call(self, method, path, body=None, on_error=None):
         url = self.base.rstrip("/") + path
@@ -80,7 +107,7 @@ class Api:
             "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
         )
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with self._opener.open(req, timeout=10) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as err:
             try:

@@ -196,6 +196,18 @@ public class DatasetState {
         return "";
     }
 
+    /** Department code embedded in a section name, e.g. "II CSE A" -> "CSE". */
+    public static String codeFromSectionName(String sectionName) {
+        if (sectionName == null) {
+            return "";
+        }
+        String upper = sectionName.trim().toUpperCase(Locale.ROOT);
+        String year = yearFromSectionName(upper);
+        String rest = year.isEmpty() ? upper : upper.substring(year.length()).trim();
+        int space = rest.indexOf(' ');
+        return (space < 0 ? rest : rest.substring(0, space)).trim();
+    }
+
     static String computeCalendarScheduleId(Map<String, Object> dataset, List<Map<String, Object>> events) {
         String academicYear = String.valueOf(dataset.getOrDefault("academicYear", "")).trim();
         String years = "";

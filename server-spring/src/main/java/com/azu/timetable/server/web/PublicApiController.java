@@ -64,16 +64,43 @@ public class PublicApiController {
     @GetMapping("/api/v1/classes")
     public Map<String, Object> classes() {
         Map<String, Object> body = new LinkedHashMap<>(state.headerMeta());
-        String department = String.valueOf(state.dataset().getOrDefault("department", "")).trim();
+        String defaultDepartment = String.valueOf(state.dataset().getOrDefault("department", "")).trim();
+        // Optional meta list maps the code embedded in a section name
+        // (e.g. "CSE") to a display name. Falls back to the dataset-level
+        // `department` field when absent.
+        Map<String, String> codeToName = new LinkedHashMap<>();
+        Object registered = state.dataset().get("departments");
+        if (registered instanceof List) {
+            for (Object raw : (List<?>) registered) {
+                if (!(raw instanceof Map)) {
+                    continue;
+                }
+                Map<String, Object> entry = (Map<String, Object>) raw;
+                String name = String.valueOf(entry.getOrDefault("name", "")).trim();
+                String code = String.valueOf(entry.getOrDefault("code", "")).trim().toUpperCase(Locale.ROOT);
+                if (!name.isEmpty()) {
+                    codeToName.putIfAbsent(code, name);
+                }
+            }
+        }
         List<Object> years = new ArrayList<>();
         List<Object> classList = new ArrayList<>();
+        List<Object> departments = new ArrayList<>();
         for (Object raw : state.sections()) {
             Map<String, Object> section = (Map<String, Object>) raw;
             String sectionId = String.valueOf(section.getOrDefault("sectionId", ""));
             String sectionName = String.valueOf(section.getOrDefault("sectionName", ""));
             String year = DatasetState.yearFromSectionName(sectionName);
+            String code = DatasetState.codeFromSectionName(sectionName);
+            String department = codeToName.getOrDefault(code, defaultDepartment);
+            if (department.isEmpty()) {
+                department = defaultDepartment;
+            }
             if (!year.isEmpty() && !years.contains(year)) {
                 years.add(year);
+            }
+            if (!department.isEmpty() && !departments.contains(department)) {
+                departments.add(department);
             }
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("sectionId", sectionId);
@@ -87,7 +114,10 @@ public class PublicApiController {
         years.sort((a, b) -> Integer.compare(
                 roman.getOrDefault(String.valueOf(a), 99),
                 roman.getOrDefault(String.valueOf(b), 99)));
-        body.put("departments", List.of(department));
+        if (departments.isEmpty() && !defaultDepartment.isEmpty()) {
+            departments.add(defaultDepartment);
+        }
+        body.put("departments", departments);
         body.put("years", years);
         body.put("classes", classList);
         return body;

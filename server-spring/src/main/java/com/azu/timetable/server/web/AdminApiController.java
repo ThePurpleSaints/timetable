@@ -116,7 +116,7 @@ public class AdminApiController {
                                            @RequestHeader(value = "Authorization", required = false) String authorization) {
         requireAdmin(authorization);
         Map<String, Object> working = state.workingCopy();
-        for (String key : List.of("timetableId", "academicYear", "department", "semester", "year")) {
+        for (String key : List.of("timetableId", "academicYear", "department", "semester", "year", "departments")) {
             if (payload.containsKey(key)) {
                 working.put(key, payload.get(key));
             }
@@ -158,7 +158,7 @@ public class AdminApiController {
         try {
 Map<String, Object> snapshot = sqlite.editorSnapshot();
         snapshot.putAll(state.headerMeta());
-        for (String key : List.of("academicYear", "department", "semester", "year")) {
+        for (String key : List.of("academicYear", "department", "semester", "year", "departments")) {
             if (state.dataset().containsKey(key)) {
                 snapshot.put(key, state.dataset().get(key));
             }

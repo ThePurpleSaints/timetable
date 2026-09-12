@@ -254,6 +254,7 @@ class EditorApp:
         ttk.Button(left, text="Reload", command=self.connect).pack(fill="x", padx=4, pady=2)
         ttk.Button(left, text="Add new section...", command=self.add_section).pack(fill="x", padx=4, pady=2)
         ttk.Button(left, text="Rename selected section...", command=self.rename_section).pack(fill="x", padx=4, pady=2)
+        ttk.Button(left, text="Departments...", command=self.manage_departments).pack(fill="x", padx=4, pady=2)
         pane.add(left)
 
         right = ttk.Frame(pane)
@@ -1248,6 +1249,9 @@ class EditorApp:
         self.snapshot = snapshot
         _save_config({"url": self.api.base, "token": self.api.token})
         self.meta = {key: self.snapshot.get(key, "") for key in META_FIELDS}
+        raw_departments = self.snapshot.get("departments")
+        if isinstance(raw_departments, list):
+            self.meta["departments"] = raw_departments
         self._calendar_events = self.snapshot.get("calendar", [])
         ids = sorted({e.get("scheduleId") for e in self._calendar_events})
         self.schedule_combo["values"] = ids
@@ -1331,20 +1335,26 @@ class EditorApp:
 
     # --- section editing ---
     def add_section(self):
+        year = text_choice(self.root, "New section", "Year:",
+                           ["I", "II", "III", "IV", "V", "VI", "VII", "VIII"])
+        if year is None:
+            return
+        codes = sorted({entry["code"] for entry in self._department_entries()}) or ["CSE"]
+        dept_code = text_choice(self.root, "New section", "Department code:", codes)
+        if dept_code is None:
+            return
         section_id = simpledialog.askstring("New section", "Section ID (e.g. J, K, A2):",
                                             initialvalue="J", parent=self.root)
         if not section_id:
             return
         section_id = section_id.strip().upper()
-        section_name = simpledialog.askstring("New section", "Section name (e.g. II CSE J):",
-                                              initialvalue=f"II CSE {section_id}", parent=self.root)
-        if not section_name:
-            return
-        classroom = simpledialog.askstring("New section", "Classroom (optional):",
-                                           initialvalue="", parent=self.root) or ""
+        classroom = simpledialog.askstring(
+            "New section",
+            f"Classroom (optional) for {year} {dept_code} {section_id}:",
+            initialvalue="", parent=self.root) or ""
         section = {
             "sectionId": section_id,
-            "sectionName": section_name.strip(),
+            "sectionName": f"{year} {dept_code} {section_id}",
             "classroom": classroom.strip(),
             "weeklyTimetable": {},
         }
@@ -1376,6 +1386,113 @@ class EditorApp:
         if response and response.get("ok"):
             self.log_line(f"Section {section_id} updated")
             self.reload_after_save()
+
+    # --- department management ---
+    def _department_entries(self):
+        """Ordered list of {'code', 'name'} dicts: registered departments from the
+        dataset meta, plus any department codes found in existing section names."""
+        entries = []
+        seen = set()
+        registered = self.meta.get("departments", [])
+        if isinstance(registered, list):
+            for raw in registered:
+                if not isinstance(raw, dict):
+                    continue
+                code = str(raw.get("code", "")).strip().upper()
+                name = str(raw.get("name", "")).strip()
+                if code and name and code not in seen:
+                    seen.add(code)
+                    entries.append({"code": code, "name": name})
+        for section in self.snapshot.get("sections", []):
+            code = self._section_meta(section)[1]
+            if code and code not in seen:
+                seen.add(code)
+                entries.append({"code": code, "name": code})
+        return entries
+
+    def manage_departments(self):
+        entries = self._department_entries()
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Departments")
+        dialog.transient(self.root)
+        listbox = tk.Listbox(dialog, width=50)
+        listbox.pack(fill="both", expand=True, padx=8, pady=8)
+
+        def refresh():
+            listbox.delete(0, "end")
+            for entry in entries:
+                listbox.insert("end", f"{entry['code']}  —  {entry['name']}")
+
+        def add():
+            edited = _dict_dialog(dialog, "Add department", ["code", "name"],
+                                  {"code": "", "name": ""})
+            if not edited:
+                return
+            code = edited["code"].strip().upper()
+            name = edited["name"].strip()
+            if not code or not name:
+                messagebox.showerror("Missing fields", "Both code and name are required.")
+                return
+            if any(entry["code"] == code for entry in entries):
+                messagebox.showerror("Duplicate", f"'{code}' already exists.")
+                return
+            entries.append({"code": code, "name": name})
+            refresh()
+
+        def edit():
+            selection = listbox.curselection()
+            if not selection:
+                messagebox.showinfo("No selection", "Select a department first.")
+                return
+            entry = entries[selection[0]]
+            edited = _dict_dialog(dialog, f"Edit {entry['code']}", ["code", "name"],
+                                  {"code": entry["code"], "name": entry["name"]})
+            if not edited:
+                return
+            code = edited["code"].strip().upper()
+            name = edited["name"].strip()
+            if not code or not name:
+                messagebox.showerror("Missing fields", "Both code and name are required.")
+                return
+            if any(entry is not other and other["code"] == code for other in entries):
+                messagebox.showerror("Duplicate", f"'{code}' already exists.")
+                return
+            entry["code"] = code
+            entry["name"] = name
+            refresh()
+
+        def remove():
+            selection = listbox.curselection()
+            if not selection:
+                return
+            removed = entries.pop(selection[0])
+            self.log_line(f"Department {removed['code']} will be removed on save")
+            refresh()
+
+        def save():
+            self.api.async_call(
+                "PUT", "/api/v1/admin/meta", {"departments": list(entries)},
+                on_done=lambda response: self._departments_saved(response, dialog),
+                on_error=self._on_api_error)
+
+        refresh()
+        ttk.Button(dialog, text="Add", command=add).pack(side="left", padx=8, pady=8)
+        ttk.Button(dialog, text="Edit", command=edit).pack(side="left", padx=4, pady=8)
+        ttk.Button(dialog, text="Remove", command=remove).pack(side="left", padx=4, pady=8)
+        ttk.Button(dialog, text="Close", command=dialog.destroy).pack(side="right", padx=4, pady=8)
+        ttk.Button(dialog, text="Save to server", command=save).pack(side="right", padx=8, pady=8)
+        dialog.grab_set()
+
+    def _departments_saved(self, response, dialog):
+        if response and response.get("ok"):
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
+            self.log_line("Departments saved")
+            self.reload_after_save()
+        else:
+            messagebox.showerror("Save failed", str(response))
 
     # --- cell editing ---
     def add_cell(self):

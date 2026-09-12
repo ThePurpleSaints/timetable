@@ -495,9 +495,11 @@ class EditorApp:
             on_error=lambda m, i=index: self._flush_failed(ordered, i, m))
 
     def _flush_failed(self, ordered, index, message):
-        self.log_line(f"[error] save failed at change #{index + 1}: {message}")
+        op = ordered[index] if index < len(ordered) else {}
+        label = f"{op.get('method', '?')} {op.get('path', '?')}"[:100]
+        self.log_line(f"[error] save failed at change #{index + 1}: {label} -> {message}")
         self._mark_dirty()
-        if messagebox.askretrycancel("Save failed", f"{message}\n\nRetry the remaining changes?"):
+        if messagebox.askretrycancel("Save failed", f"{message}\n\nFailed request: {label}\n\nRetry the remaining changes?"):
             self._flush_next(ordered, index)
         else:
             self._clear_pending_staged()
